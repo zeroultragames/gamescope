@@ -109,6 +109,13 @@ struct steamcompmgr_win_t {
 	bool utf8_title = false;
 	pid_t pid = -1;
 
+	// PiP process-membership cache; see window_belongs_to_pip_process() in
+	// steamcompmgr.cpp. A window's pid is immutable after creation, so this
+	// only needs to be recomputed if the tracked PiP process pid changes
+	// (which only ever happens once, at startup).
+	pid_t pipMembershipCachedForPid = 0;
+	bool bPipMembershipCached = false;
+
 	bool isSteamLegacyBigPicture = false;
 	bool isSteamStreamingClient = false;
 	bool isSteamStreamingClientVideo = false;

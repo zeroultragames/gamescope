@@ -21,7 +21,12 @@ cap_dep = dependency('libcap', required: get_option('rt_cap'))
 epoll_dep = dependency('epoll-shim', required: false)
 sdl2_dep = dependency('SDL2', required: get_option('sdl2_backend'))
 avif_dep = dependency('libavif', version: '>=1.0.0', required: get_option('avif_screenshots'))
-pixman_dep = dependency('pixman-1')
+pixman_dep = dependency(
+  'pixman-1',
+  version: '>=0.43.0',
+  fallback: 'pixman',
+  default_options: ['werror=false'],
+)
 udev_dep = dependency('libudev')
 
 wlroots_dep = dependency(

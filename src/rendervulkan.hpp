@@ -37,6 +37,13 @@ class CVulkanCmdBuffer;
 // 4: External Overlay (Mangoapp, etc)
 // 5: Primary Overlay (Steam Overlay)
 // 6: Cursor
+//
+// Picture-in-Picture opportunistically uses one of the layers above rather
+// than reserving a dedicated slot: paint_all() only paints it when there's
+// spare headroom (frameInfo.layerCount < k_nMaxLayers - 2), so it's simply
+// skipped for a frame if every other layer is already in use. Don't raise
+// k_nMaxLayers to "make room" for it without auditing backend layer/plane
+// limits (eg. DRM plane counts) first.
 #define k_nMaxLayers 6
 #define k_nMaxYcbcrMask 16
 #define k_nMaxYcbcrMask_ToPreCompile 3

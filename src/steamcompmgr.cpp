@@ -798,6 +798,27 @@ constexpr const T& clamp( const T& x, const T& min, const T& max )
 }
 
 extern bool g_bForceRelativeMouse;
+extern bool g_bPiP;
+extern std::string g_sPipCommand;
+extern float g_flPipAspectRatio;
+extern int g_nPipSizePercent;
+extern int g_nPipInsetPercent;
+
+// Tracks the PID of the process launched via --pip-command / pip_enable, if any.
+// See the "Picture-in-Picture" section below.
+static pid_t g_nPipProcessPid = 0;
+
+// When true, mouse/keyboard go to pipWindow while paint roles stay unchanged
+// (focusWindow remains fullscreen, pipWindow remains inset). Role-sticky across
+// SwapPiP. Cleared when PiP is unavailable (see determine_and_apply_focus).
+// Consumers: paint_all touch-scaling, X11 DetermineAndApplyFocus override,
+// global inputFocusWindow/keyboardFocusWindow pick.
+static bool g_bPipInputFocus = false;
+
+static inline bool PipInputFocusActive( const focus_t *pFocus )
+{
+	return g_bPipInputFocus && g_bPiP && pFocus && pFocus->pipWindow;
+}
 
 CommitDoneList_t g_steamcompmgr_xdg_done_commits;
 
@@ -2505,6 +2526,66 @@ gamescope::ConVar<bool> cv_paint_external_overlay_plane{ "paint_external_overlay
 gamescope::ConVar<bool> cv_paint_cursor_plane{ "paint_cursor_plane", true };
 gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 
+// --- PiP size/inset layout -------------------------------------------------
+// Budget-box size: g_nPipSizePercent (bounds: k_nPipSizePercentMin/Max)
+// Corner inset:    g_nPipInsetPercent, or auto via PipInsetFraction() below.
+// The PiP rectangle is the largest box of the configured aspect ratio that
+// fits inside the budget, anchored to the lower-right with that inset.
+
+static float
+PipInsetFraction()
+{
+	if ( g_nPipInsetPercent >= 0 )
+		return g_nPipInsetPercent / 100.f;
+
+	const float flSizeT = ( g_nPipSizePercent - k_nPipSizePercentMin )
+		/ float( k_nPipSizePercentMax - k_nPipSizePercentMin );
+	const float flAutoInsetPercent = k_flPipAutoInsetPercentAtMinSize
+		+ flSizeT * ( k_flPipAutoInsetPercentAtMaxSize - k_flPipAutoInsetPercentAtMinSize );
+	return flAutoInsetPercent / 100.f;
+}
+
+// Positions and scales an already-painted PiP layer into its fixed
+// lower-right corner geometry.
+static void
+ApplyPipLayerLayout( FrameInfo_t::Layer_t *layer )
+{
+	assert( g_nPipSizePercent >= k_nPipSizePercentMin && g_nPipSizePercent <= k_nPipSizePercentMax );
+	assert( g_nPipInsetPercent == -1
+		|| ( g_nPipInsetPercent >= k_nPipInsetPercentMin && g_nPipInsetPercent <= k_nPipInsetPercentMax ) );
+
+	const float flSizeFraction = g_nPipSizePercent / 100.f;
+	const float budgetW = currentOutputWidth * flSizeFraction;
+	const float budgetH = currentOutputHeight * flSizeFraction;
+	const float flOutputAspect = currentOutputWidth / float( currentOutputHeight );
+	const float flAspect = g_flPipAspectRatio > 0.f ? g_flPipAspectRatio : flOutputAspect;
+
+	float pipW;
+	float pipH;
+	// budgetW/budgetH == flOutputAspect (same size fraction on both axes).
+	if ( flOutputAspect > flAspect )
+	{
+		pipH = budgetH;
+		pipW = budgetH * flAspect;
+	}
+	else
+	{
+		pipW = budgetW;
+		pipH = budgetW / flAspect;
+	}
+
+	const float flInsetFraction = PipInsetFraction();
+	const float pipX = currentOutputWidth - ( flInsetFraction * currentOutputWidth ) - pipW;
+	const float pipY = currentOutputHeight - ( flInsetFraction * currentOutputHeight ) - pipH;
+
+	layer->scale.x = layer->tex->width() / pipW;
+	layer->scale.y = layer->tex->height() / pipH;
+	layer->offset.x = -pipX;
+	layer->offset.y = -pipY;
+	layer->zpos = g_zposOverride;
+	layer->filter = GamescopeUpscaleFilter::LINEAR;
+}
+
 static void
 paint_all( global_focus_t *pFocus, bool async )
 {
@@ -2540,6 +2621,7 @@ paint_all( global_focus_t *pFocus, bool async )
 	notification = pFocus->notificationWindow;
 	override = pFocus->overrideWindow;
 	input = pFocus->inputFocusWindow;
+	global_focus_t *pCurrentFocus = GetCurrentFocus();
 
 	if (++frameCounter == 300)
 	{
@@ -2597,7 +2679,7 @@ paint_all( global_focus_t *pFocus, bool async )
 				if ( !bHasVideoUnderlay )
 					flags |= PaintWindowFlag::BasePlane;
 				paint_window(w, w, &frameInfo, pFocus->cursor, flags);
-				if ( pFocus == GetCurrentFocus() )
+				if ( pFocus == pCurrentFocus )
 					update_touch_scaling( &frameInfo );
 				
 				// paint UI unless it's fully hidden, which it communicates to us through opacity=0
@@ -2634,7 +2716,7 @@ paint_all( global_focus_t *pFocus, bool async )
 					frameInfo.useFSRLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::FSR && needsScaling;
 					frameInfo.useNISLayer0 = g_upscaleFilter == GamescopeUpscaleFilter::NIS && needsScaling;
 				}
-				if ( pFocus == GetCurrentFocus() )
+				if ( pFocus == pCurrentFocus )
 					update_touch_scaling( &frameInfo );
 			}
 		}
@@ -2667,6 +2749,31 @@ paint_all( global_focus_t *pFocus, bool async )
 		//update_touch_scaling( &frameInfo );
 	}
 
+	// PiP is resolved once per focus reroll in determine_and_apply_focus(),
+	// not here, to avoid rebuilding/sorting the global window list every
+	// paint. Just honor the current enable state -- this keeps toggling PiP
+	// off instant even without an intervening focus-dirty event.
+	if ( !g_bPiP )
+		pFocus->pipWindow = nullptr;
+
+	steamcompmgr_win_t *pip = pFocus->pipWindow;
+	if ( pip && pip != w && pip != override &&
+		 frameInfo.layerCount < k_nMaxLayers - 2 )
+	{
+		int nLayerBeforePip = frameInfo.layerCount;
+		paint_window( pip, pip, &frameInfo, pFocus->cursor, PaintWindowFlag::NoFilter );
+		if ( frameInfo.layerCount > nLayerBeforePip )
+		{
+			FrameInfo_t::Layer_t *layer = &frameInfo.layers[ frameInfo.layerCount - 1 ];
+			if ( layer->tex )
+			{
+				ApplyPipLayerLayout( layer );
+				if ( PipInputFocusActive( pFocus ) && pFocus == pCurrentFocus )
+					update_touch_scaling( &frameInfo );
+			}
+		}
+	}
+
 	// If we have any layers that aren't a cursor or overlay, then we have valid contents for presentation.
 	const bool bValidContents = frameInfo.layerCount > 0;
 
@@ -2677,7 +2784,7 @@ paint_all( global_focus_t *pFocus, bool async )
 			paint_window(externalOverlay, externalOverlay, &frameInfo, pFocus->cursor, PaintWindowFlag::NoScale | PaintWindowFlag::NoFilter |
 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 ) );
 
-			if ( externalOverlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
+			if ( externalOverlay == pFocus->inputFocusWindow && pFocus == pCurrentFocus )
 				update_touch_scaling( &frameInfo );
 		}
 	}
@@ -2689,7 +2796,7 @@ paint_all( global_focus_t *pFocus, bool async )
 			paint_window(overlay, overlay, &frameInfo, pFocus->cursor, PaintWindowFlag::DrawBorders | PaintWindowFlag::NoFilter |
 				( cv_overlay_unmultiplied_alpha ? PaintWindowFlag::CoverageMode : 0 )  );
 
-			if ( overlay == pFocus->inputFocusWindow && pFocus == GetCurrentFocus() )
+			if ( overlay == pFocus->inputFocusWindow && pFocus == pCurrentFocus )
 				update_touch_scaling( &frameInfo );
 		}
 		else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
@@ -3433,6 +3540,479 @@ win_is_disabled( steamcompmgr_win_t *w )
 	return !!(w->hwndStyle & WS_DISABLED);
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// Picture-in-Picture (PiP)
+//
+// The PiP layer shows a second live client on top of the primary focus
+// window (see paint_all()). It is resolved once per focus reroll, in
+// determine_and_apply_focus(), rather than every paint -- building/sorting
+// the full focus candidate list and figuring out priority isn't free, and
+// paint_all() can run far more often than focus actually changes. The result
+// is cached in focus_t::pipWindow until the next reroll; new commits to an
+// already-resolved PiP window just need a repaint, not a re-resolve.
+//
+// The window shown is picked, in priority order, from:
+//   1. A window belonging to the dedicated --pip-command process, if one was
+//      launched (tracked by g_nPipProcessPid).
+//   2. The most recently demoted focus window (focus_t::pipCandidate,
+//      latched in determine_and_apply_focus()).
+//   3. Any other live, non-Steam window.
+//////////////////////////////////////////////////////////////////////////////
+
+// Walks up the /proc process tree from pid looking for ancestor. Expensive
+// (opens and parses a /proc/<pid>/stat file per generation), so callers
+// should go through window_belongs_to_pip_process()'s cache rather than
+// calling this directly on a hot path.
+static bool
+pid_is_descendant_of( pid_t pid, pid_t ancestor )
+{
+	if ( pid <= 0 || ancestor <= 0 )
+		return false;
+
+	while ( pid > 1 )
+	{
+		if ( pid == ancestor )
+			return true;
+
+		char filename[64];
+		snprintf( filename, sizeof( filename ), "/proc/%d/stat", pid );
+		std::ifstream proc_stat_file( filename );
+		if ( !proc_stat_file.is_open() || proc_stat_file.bad() )
+			break;
+
+		std::string proc_stat;
+		std::getline( proc_stat_file, proc_stat );
+
+		const size_t lastParen = proc_stat.rfind( ')' );
+		if ( lastParen == std::string::npos || lastParen + 1 >= proc_stat.size() )
+			break;
+
+		char state = 0;
+		int parent_pid = -1;
+		if ( sscanf( proc_stat.c_str() + lastParen + 1, " %c %d", &state, &parent_pid ) != 2 )
+			break;
+
+		if ( parent_pid <= 1 || parent_pid == pid )
+			break;
+
+		pid = parent_pid;
+	}
+
+	return pid == ancestor;
+}
+
+// Whether a window belongs to the dedicated --pip-command process tree.
+// A window's pid is immutable after creation, so the (possibly expensive,
+// /proc-walking) result is cached on the window itself. The only thing that
+// can invalidate it is the tracked PiP process pid changing, which only
+// happens once, at startup, so we detect that by stashing the pid the cache
+// was last computed against.
+static bool
+window_belongs_to_pip_process( steamcompmgr_win_t *w )
+{
+	if ( !w || g_nPipProcessPid <= 0 )
+		return false;
+
+	if ( w->pipMembershipCachedForPid != g_nPipProcessPid )
+	{
+		w->bPipMembershipCached = pid_is_descendant_of( w->pid, g_nPipProcessPid );
+		w->pipMembershipCachedForPid = g_nPipProcessPid;
+	}
+
+	return w->bPipMembershipCached;
+}
+
+static bool
+is_valid_pip_window( steamcompmgr_win_t *w, steamcompmgr_win_t *focusWindow )
+{
+	return w
+		&& w != focusWindow
+		&& !w->IsAnyOverlay()
+		&& !win_is_override_redirect( w )
+		&& !win_is_useless( w );
+}
+
+// A structurally-valid PiP candidate that hasn't produced a frame yet can't
+// be shown, but we still need to notice once it does. Reuse the same
+// outdatedInteractiveFocus + MakeFocusDirty() mechanism used for the primary
+// focus window (see pick_primary_focus_and_override()) so that a fresh
+// commit triggers a re-resolve instead of the window being stuck unshown.
+static bool
+is_ready_pip_window( steamcompmgr_win_t *w )
+{
+	if ( window_has_commits( w ) )
+		return true;
+
+	w->outdatedInteractiveFocus = true;
+	return false;
+}
+
+// Picks the window (if any) to show in the PiP layer. Takes the
+// already-sorted global focus candidate list built by the caller
+// (determine_and_apply_focus()) to avoid building and sorting it twice.
+static steamcompmgr_win_t *
+ResolvePipWindow( global_focus_t *pFocus, const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
+{
+	if ( !pFocus || !g_bPiP )
+		return nullptr;
+
+	if ( g_nPipProcessPid > 0 )
+	{
+		for ( steamcompmgr_win_t *candidate : vecPossibleFocusWindows )
+		{
+			if ( is_valid_pip_window( candidate, pFocus->focusWindow ) &&
+				 window_belongs_to_pip_process( candidate ) &&
+				 is_ready_pip_window( candidate ) )
+				return candidate;
+		}
+	}
+
+	if ( is_valid_pip_window( pFocus->pipCandidate, pFocus->focusWindow ) &&
+		 is_ready_pip_window( pFocus->pipCandidate ) )
+		return pFocus->pipCandidate;
+
+	for ( steamcompmgr_win_t *candidate : vecPossibleFocusWindows )
+	{
+		if ( is_valid_pip_window( candidate, pFocus->focusWindow ) &&
+			 !window_is_steam( candidate ) &&
+			 is_ready_pip_window( candidate ) )
+			return candidate;
+	}
+
+	return nullptr;
+}
+
+// Clears any PiP references on pFocus matching fnMatches. Used from window
+// destroy/teardown paths so pipWindow/pipCandidate/pipPreferredFocus never
+// dangle. Callers are still responsible for calling MakeFocusDirty() as usual.
+template < typename MatchFn >
+static void
+clear_pip_refs_matching( focus_t *pFocus, MatchFn &&fnMatches )
+{
+	if ( !pFocus )
+		return;
+
+	if ( pFocus->pipWindow && fnMatches( pFocus->pipWindow ) )
+		pFocus->pipWindow = nullptr;
+	if ( pFocus->pipCandidate && fnMatches( pFocus->pipCandidate ) )
+		pFocus->pipCandidate = nullptr;
+	if ( pFocus->pipPreferredFocus && fnMatches( pFocus->pipPreferredFocus ) )
+		pFocus->pipPreferredFocus = nullptr;
+}
+
+// Common tail of every PiP state change (enable/disable/toggle/swap): the
+// change only takes visible effect once focus is rerolled, so dirty it and
+// wake the compositor thread rather than waiting on some unrelated event.
+static inline void
+RequestPipFocusReroll()
+{
+	MakeFocusDirty();
+	nudge_steamcompmgr();
+}
+
+// Super+P: show/hide the PiP layer without touching the underlying process.
+// This is a lightweight visibility flip -- unlike DisablePiP()/pip_disable,
+// it never kills g_nPipProcessPid or clears g_sPipCommand, so toggling back
+// on resumes showing the same (still-running) client instantly.
+void TogglePiP()
+{
+	g_bPiP = !g_bPiP;
+	RequestPipFocusReroll();
+}
+
+// pip_disable: fully tears down PiP -- kills the tracked --pip-command /
+// pip_enable process (if any), forgets the command, and turns PiP off.
+// Distinct from TogglePiP()/Super+P, which only hides the layer and leaves
+// the process and g_sPipCommand alone.
+static void
+DisablePiP()
+{
+	// Already fully idle (never enabled, or a previous DisablePiP() already
+	// tore it down) -- bail out before dirtying focus/nudging the compositor
+	// for nothing. g_nPipProcessPid is checked rather than just g_bPiP since
+	// TogglePiP() (Super+P) can leave g_bPiP false while the process is still
+	// alive; that case must still fall through and get killed below.
+	if ( g_nPipProcessPid <= 0 && !g_bPiP && g_sPipCommand.empty() )
+	{
+		// No reroll on this path; clear directly so the flag cannot stick.
+		g_bPipInputFocus = false;
+		return;
+	}
+
+	if ( g_nPipProcessPid > 0 )
+	{
+		gamescope::Process::KillProcess( g_nPipProcessPid, SIGTERM );
+		g_nPipProcessPid = 0;
+	}
+
+	g_sPipCommand.clear();
+	g_bPiP = false;
+
+	if ( global_focus_t *pFocus = GetCurrentFocus() )
+		clear_pip_refs_matching( pFocus, []( steamcompmgr_win_t * ) { return true; } );
+
+	RequestPipFocusReroll();
+}
+
+// pip_enable / --pip-command: (re-)launches the dedicated PiP client via
+// `sh -c <command>`, replacing any previously-running one.
+static void
+EnablePiP( std::string_view svCommand )
+{
+	if ( svCommand.empty() )
+		return;
+
+	// Copy before DisablePiP() so re-enabling with the same backing storage
+	// (e.g. startup: EnablePiP( g_sPipCommand )) survives DisablePiP()
+	// clearing g_sPipCommand out from under svCommand.
+	std::string sCommand{ svCommand };
+
+	DisablePiP();
+
+	g_sPipCommand = std::move( sCommand );
+	char *ppPipArgv[] = { (char *)"sh", (char *)"-c", g_sPipCommand.data(), NULL };
+	g_nPipProcessPid = gamescope::Process::SpawnProcessInWatchdog( ppPipArgv, false );
+	if ( g_nPipProcessPid <= 0 )
+	{
+		console_log.errorf( "Failed to launch PiP command: %s", g_sPipCommand.c_str() );
+		g_sPipCommand.clear();
+		return;
+	}
+
+	g_bPiP = true;
+	RequestPipFocusReroll();
+}
+
+static gamescope::ConCommand cc_pip_enable(
+	"pip_enable",
+	"Launch (or replace) the PiP client. Usage: pip_enable \"<command>\"",
+	[]( std::span<std::string_view> args )
+	{
+		if ( args.size() < 2 || args[1].empty() )
+		{
+			console_log.warnf( "pip_enable: expected a command string" );
+			return;
+		}
+		EnablePiP( args[1] );
+	} );
+
+static gamescope::ConCommand cc_pip_disable(
+	"pip_disable",
+	"Stop the PiP client and hide the PiP layer",
+	[]( std::span<std::string_view> )
+	{
+		DisablePiP();
+	} );
+
+static gamescope::ConCommand cc_pip_toggle(
+	"pip_toggle",
+	"Toggle PiP visibility (same as Super+P)",
+	[]( std::span<std::string_view> )
+	{
+		TogglePiP();
+	} );
+
+static gamescope::ConCommand cc_pip_swap(
+	"pip_swap",
+	"Swap the main window and PiP (same as Super+Shift+P)",
+	[]( std::span<std::string_view> )
+	{
+		SwapPiP();
+	} );
+
+static gamescope::ConCommand cc_pip_focus(
+	"pip_focus",
+	"Route mouse and keyboard to the PiP window without swapping layout",
+	[]( std::span<std::string_view> )
+	{
+		FocusPiPInput();
+	} );
+
+static gamescope::ConCommand cc_pip_focus_main(
+	"pip_focus_main",
+	"Route mouse and keyboard back to the main window",
+	[]( std::span<std::string_view> )
+	{
+		FocusMainInput();
+	} );
+
+// Layout knobs need both: force_repaint() so the change is visible even if
+// nothing else dirties the frame, and nudge_steamcompmgr() to wake the thread.
+static void NotifyPipConfigChanged()
+{
+	force_repaint();
+	nudge_steamcompmgr();
+}
+
+static gamescope::ConCommand cc_pip_aspect_ratio(
+	"pip_aspect_ratio",
+	"Set PiP frame aspect ratio as W:H (e.g. 16:9). Usage: pip_aspect_ratio [W:H|auto]. No args prints the current value.",
+	[]( std::span<std::string_view> args )
+	{
+		if ( args.size() < 2 )
+		{
+			if ( g_flPipAspectRatio <= 0.f )
+				console_log.infof( "pip_aspect_ratio = auto" );
+			else
+				console_log.infof( "pip_aspect_ratio = %g", g_flPipAspectRatio );
+			return;
+		}
+
+		float flAspect = 0.f;
+		if ( !ParsePipAspectRatioArg( args[1], &flAspect ) )
+		{
+			console_log.warnf( "pip_aspect_ratio: expected W:H, auto, or 0 (got \"%.*s\")",
+				int( args[1].size() ), args[1].data() );
+			return;
+		}
+
+		g_flPipAspectRatio = flAspect;
+		NotifyPipConfigChanged();
+	} );
+
+static gamescope::ConCommand cc_pip_size_percent(
+	"pip_size_percent",
+	"Set PiP size as a percent of output width/height (whole number 10-50). Usage: pip_size_percent [percent]. No args prints the current value.",
+	[]( std::span<std::string_view> args )
+	{
+		if ( args.size() < 2 )
+		{
+			console_log.infof( "pip_size_percent = %d", g_nPipSizePercent );
+			return;
+		}
+
+		int nPercent = 0;
+		if ( !ParsePipSizePercentArg( args[1], &nPercent ) )
+		{
+			console_log.warnf( "pip_size_percent: expected a whole number from %d to %d (got \"%.*s\")",
+				k_nPipSizePercentMin, k_nPipSizePercentMax, int( args[1].size() ), args[1].data() );
+			return;
+		}
+
+		g_nPipSizePercent = nPercent;
+		NotifyPipConfigChanged();
+	} );
+
+static gamescope::ConCommand cc_pip_inset_percent(
+	"pip_inset_percent",
+	"Set PiP corner inset as a percent of output (whole number 0-40), or auto. Usage: pip_inset_percent [percent|auto]. No args prints the current value.",
+	[]( std::span<std::string_view> args )
+	{
+		if ( args.size() < 2 )
+		{
+			if ( g_nPipInsetPercent < 0 )
+				console_log.infof( "pip_inset_percent = auto" );
+			else
+				console_log.infof( "pip_inset_percent = %d", g_nPipInsetPercent );
+			return;
+		}
+
+		int nPercent = 0;
+		if ( !ParsePipInsetPercentArg( args[1], &nPercent ) )
+		{
+			console_log.warnf( "pip_inset_percent: expected a whole number from %d to %d, or auto (got \"%.*s\")",
+				k_nPipInsetPercentMin, k_nPipInsetPercentMax, int( args[1].size() ), args[1].data() );
+			return;
+		}
+
+		g_nPipInsetPercent = nPercent;
+		NotifyPipConfigChanged();
+	} );
+
+void SwapPiP()
+{
+	if ( !g_bPiP )
+		return;
+
+	global_focus_t *pFocus = GetCurrentFocus();
+	if ( !pFocus || !pFocus->focusWindow || !pFocus->pipWindow )
+		return;
+
+	// Preserve g_bPipInputFocus across the visual swap so input stays on the
+	// same role (main vs pip), not the same client window.
+
+	if ( !pFocus->pipPreferredFocus )
+	{
+		pFocus->pipPreferredFocus = pFocus->pipWindow;
+		pFocus->pipCandidate = pFocus->focusWindow;
+	}
+	else
+	{
+		pFocus->pipPreferredFocus = nullptr;
+	}
+
+	RequestPipFocusReroll();
+}
+
+void FocusPiPInput()
+{
+	if ( !g_bPiP )
+		return;
+
+	global_focus_t *pFocus = GetCurrentFocus();
+	if ( !pFocus || !pFocus->pipWindow )
+		return;
+
+	g_bPipInputFocus = true;
+	RequestPipFocusReroll();
+}
+
+void FocusMainInput()
+{
+	if ( !g_bPipInputFocus )
+		return;
+
+	g_bPipInputFocus = false;
+	RequestPipFocusReroll();
+}
+
+void TogglePipInputFocus()
+{
+	if ( g_bPipInputFocus )
+		FocusMainInput();
+	else
+		FocusPiPInput();
+}
+
+// If a sticky PiP-swap preferred focus is still focusable, promote it to
+// focusWindow so input (XSetInputFocus / wlserver) follows the swapped main
+// window. Returns true when applied.
+static bool
+try_apply_pip_preferred_focus( focus_t *pFocus, const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
+{
+	if ( !pFocus || !pFocus->pipPreferredFocus )
+		return false;
+
+	const bool bPreferredStillFocusable = std::find(
+		vecPossibleFocusWindows.begin(),
+		vecPossibleFocusWindows.end(),
+		pFocus->pipPreferredFocus ) != vecPossibleFocusWindows.end();
+	if ( !bPreferredStillFocusable )
+		return false;
+
+	pFocus->focusWindow = pFocus->pipPreferredFocus;
+
+	// Drop overrides from the previous primary so keyboard/mouse cannot stick
+	// to the demoted (now-PiP) client's dropdowns.
+	pFocus->overrideWindow = nullptr;
+	pFocus->overrideWindowMouse = nullptr;
+
+	return true;
+}
+
+// Propagates the global sticky PiP-swap preferred focus down into a local
+// (per-XWayland-server or XDG) focus_t. This is the single place that keeps
+// local focus in sync, and must run before that local focus_t's
+// DetermineAndApplyFocus()/steamcompmgr_xdg_determine_and_apply_focus() --
+// those call try_apply_pip_preferred_focus() on the local focus_t so the
+// promotion is visible to local XSetInputFocus/inputFocus derivation, not
+// just the global focus used for paint/wlserver.
+static inline void
+sync_pip_preferred_focus( focus_t *pLocalFocus, const global_focus_t *pFocus )
+{
+	pLocalFocus->pipPreferredFocus = pFocus->pipPreferredFocus;
+}
+
 /* Returns true if a's focus priority > b's.
  *
  * This function establishes a list of criteria to decide which window should
@@ -3448,6 +4028,13 @@ win_is_disabled( steamcompmgr_win_t *w )
 static bool
 is_focus_priority_greater( steamcompmgr_win_t *a, steamcompmgr_win_t *b )
 {
+	// Dedicated PiP clients should never take over the primary fullscreen plane.
+	// (g_nPipProcessPid check first so we don't even call into the (cached,
+	// but still non-trivial) membership check when no --pip-command is running.)
+	if ( g_nPipProcessPid > 0 &&
+		 window_belongs_to_pip_process( a ) != window_belongs_to_pip_process( b ) )
+		return !window_belongs_to_pip_process( a );
+
 	if ( win_has_game_id( a ) != win_has_game_id( b ) )
 		return win_has_game_id( a );
 
@@ -3847,6 +4434,10 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 
 	pick_primary_focus_and_override( &ctx->focus, ctx->focusControlWindow, vecPossibleFocusWindows, false, vecFocuscontrolAppIDs, ulKey, eStrategy );
 
+	// Apply sticky PiP-swap preferred focus before deriving input focus /
+	// XSetInputFocus, otherwise the demoted primary keeps keyboard/mouse.
+	try_apply_pip_preferred_focus( &ctx->focus, vecPossibleFocusWindows );
+
 	if ( !ctx->focus.overrideWindowMouse )
 	{
 		ctx->focus.overrideWindowMouse = ctx->focus.overrideWindow;
@@ -3946,6 +4537,29 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 		inputFocus = ctx->focus.focusWindow;
 	}
 
+	// PiP input focus (layout unchanged): route X11 keyboard/mouse to the
+	// global pipWindow when it lives on this ctx. If PiP owns input and this
+	// ctx holds the demoted main window, skip XSetInputFocus so we don't steal
+	// onto main; unrelated ctxs are left alone.
+	bool bSkipXInputFocusForPip = false;
+	global_focus_t *pGlobalFocus = GetCurrentFocus();
+	if ( PipInputFocusActive( pGlobalFocus ) )
+	{
+		steamcompmgr_win_t *pipWin = pGlobalFocus->pipWindow;
+		if ( pipWin->type == steamcompmgr_win_type_t::XWAYLAND &&
+			 pipWin->xwayland().ctx == ctx )
+		{
+			inputFocus = pipWin;
+			keyboardFocusWin = pipWin;
+		}
+		else if ( pGlobalFocus->focusWindow &&
+			 pGlobalFocus->focusWindow->type == steamcompmgr_win_type_t::XWAYLAND &&
+			 pGlobalFocus->focusWindow->xwayland().ctx == ctx )
+		{
+			bSkipXInputFocusForPip = true;
+		}
+	}
+
 	Window keyboardFocusWindow = keyboardFocusWin ? keyboardFocusWin->xwayland().id : None;
 
 	// If the top level parent of our current keyboard window is the same as our target (top level) input focus window
@@ -3954,9 +4568,10 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 	if ( keyboardFocusWindow && ctx->currentKeyboardFocusWindow && find_win( ctx, ctx->currentKeyboardFocusWindow ) == keyboardFocusWin )
 		keyboardFocusWindow = ctx->currentKeyboardFocusWindow;
 
-	if ( ctx->focus.inputFocusWindow != inputFocus ||
+	if ( !bSkipXInputFocusForPip &&
+		( ctx->focus.inputFocusWindow != inputFocus ||
 		ctx->focus.inputFocusMode != inputFocus->inputFocusMode ||
-		ctx->currentKeyboardFocusWindow != keyboardFocusWindow )
+		ctx->currentKeyboardFocusWindow != keyboardFocusWindow ) )
 	{
 		if ( debugFocus == true )
 		{
@@ -4141,6 +4756,7 @@ steamcompmgr_xdg_determine_and_apply_focus( const std::vector< steamcompmgr_win_
 		: gamescope::VirtualConnectorStrategies::PerWindow;
 
 	pick_primary_focus_and_override( &g_steamcompmgr_xdg_focus, None, vecPossibleFocusWindows, false, vecFocuscontrolAppIDs, 0, eStrategy );
+	try_apply_pip_preferred_focus( &g_steamcompmgr_xdg_focus, vecPossibleFocusWindows );
 }
 
 uint32_t g_focusedBaseAppId = 0;
@@ -4156,6 +4772,8 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	pFocus->cursor = root_ctx->cursor.get();
 	pFocus->ulVirtualFocusKey = previousLocalFocus.ulVirtualFocusKey;
 	pFocus->pVirtualConnector = previousLocalFocus.pVirtualConnector;
+	pFocus->pipCandidate = previousLocalFocus.pipCandidate;
+	pFocus->pipPreferredFocus = previousLocalFocus.pipPreferredFocus;
 	gameFocused = false;
 
 	focus_log.debugf( "Rerolling global focus..." );
@@ -4163,25 +4781,8 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	std::vector< unsigned long > focusable_appids;
 	std::vector< unsigned long > focusable_windows;
 
-	// Apply focus to the XWayland contexts.
-	{
-		gamescope_xwayland_server_t *server = NULL;
-		for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-		{
-			std::vector< steamcompmgr_win_t* > vecLocalPossibleFocusWindows = server->ctx->GetPossibleFocusWindows();
-			if ( server->ctx->focus.IsDirty() )
-				server->ctx->DetermineAndApplyFocus( vecLocalPossibleFocusWindows );
-		}
-	}
-
-	// Apply focus to XDG contexts (TODO merge me with some nice abstraction of "environments")
-	{
-		std::vector< steamcompmgr_win_t* > vecLocalPossibleFocusWindows = steamcompmgr_xdg_get_possible_focus_windows();
-		if ( g_steamcompmgr_xdg_focus.IsDirty() )
-			steamcompmgr_xdg_determine_and_apply_focus( vecLocalPossibleFocusWindows );
-	}
-
-	// Determine local context focuses
+	// Resolve global primary focus + PiP before per-ctx XWayland/XDG apply so
+	// XSetInputFocus can route to this reroll's pipWindow (not a stale one).
 	std::vector<steamcompmgr_win_t *> vecPossibleFocusWindows = GetGlobalPossibleFocusWindows();
 
 	for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
@@ -4229,7 +4830,48 @@ determine_and_apply_focus( global_focus_t *pFocus )
 		pFocus->ulVirtualFocusKey,
 		gamescope::cv_backend_virtual_connector_strategy );
 
-	// Pick overlay/notifications from root ctx
+	// Sticky PiP swap: keep the promoted PiP client as primary focus across
+	// rerolls so --pip-command deprioritization cannot undo the swap. Once
+	// the preferred window stops being focusable (e.g. it closed), drop the
+	// stickiness -- try_apply_pip_preferred_focus() is a no-op if there was
+	// nothing to apply, so this is safe to call unconditionally.
+	if ( !try_apply_pip_preferred_focus( pFocus, vecPossibleFocusWindows ) )
+		pFocus->pipPreferredFocus = nullptr;
+
+	// Latch the demoted focus window as a PiP candidate before resolve so the
+	// just-demoted primary can become the PiP source on this same reroll.
+	if ( previousLocalFocus.focusWindow != nullptr &&
+		 previousLocalFocus.focusWindow != pFocus->focusWindow )
+	{
+		pFocus->pipCandidate = previousLocalFocus.focusWindow;
+	}
+
+	pFocus->pipWindow = ResolvePipWindow( pFocus, vecPossibleFocusWindows );
+	if ( g_bPipInputFocus && ( !g_bPiP || !pFocus->pipWindow ) )
+		g_bPipInputFocus = false;
+
+	// Apply focus to the XWayland contexts (after ResolvePipWindow so the
+	// PiP input-focus X11 override sees this reroll's pipWindow).
+	{
+		gamescope_xwayland_server_t *server = NULL;
+		for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+		{
+			sync_pip_preferred_focus( &server->ctx->focus, pFocus );
+			std::vector< steamcompmgr_win_t* > vecLocalPossibleFocusWindows = server->ctx->GetPossibleFocusWindows();
+			if ( server->ctx->focus.IsDirty() )
+				server->ctx->DetermineAndApplyFocus( vecLocalPossibleFocusWindows );
+		}
+	}
+
+	// Apply focus to XDG contexts (TODO merge me with some nice abstraction of "environments")
+	{
+		sync_pip_preferred_focus( &g_steamcompmgr_xdg_focus, pFocus );
+		std::vector< steamcompmgr_win_t* > vecLocalPossibleFocusWindows = steamcompmgr_xdg_get_possible_focus_windows();
+		if ( g_steamcompmgr_xdg_focus.IsDirty() )
+			steamcompmgr_xdg_determine_and_apply_focus( vecLocalPossibleFocusWindows );
+	}
+
+	// Pick overlay/notifications from root ctx (populated by the local apply above)
 	pFocus->overlayWindow = root_ctx->focus.overlayWindow;
 	pFocus->externalOverlayWindow = root_ctx->focus.externalOverlayWindow;
 	pFocus->notificationWindow = root_ctx->focus.notificationWindow;
@@ -4328,6 +4970,17 @@ determine_and_apply_focus( global_focus_t *pFocus )
 		pFocus->keyboardFocusWindow = pFocus->overrideWindow
 			? pFocus->overrideWindow
 			: pFocus->focusWindow;
+	}
+
+	// PiP input focus: keep paint roles, override keyboard/mouse onto pipWindow.
+	if ( PipInputFocusActive( pFocus ) )
+	{
+		pFocus->inputFocusWindow = pFocus->pipWindow;
+		pFocus->keyboardFocusWindow = pFocus->pipWindow;
+		pFocus->inputFocusMode = pFocus->pipWindow->inputFocusMode;
+
+		if ( pFocus->pipWindow->type == steamcompmgr_win_type_t::XWAYLAND )
+			pFocus->cursor = pFocus->pipWindow->xwayland().ctx->cursor.get();
 	}
 
 	// TODO(strategy): multi-seat on Wayland side
@@ -4518,7 +5171,11 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	// Sort out fading.
 	if (pFocus->focusWindow && previousLocalFocus.focusWindow != pFocus->focusWindow)
 	{
-		bool bDoFade = win_has_game_id( pFocus->focusWindow );
+		// Skip fade on PiP swap transitions (sticky preferred focus equals the
+		// newly promoted main window).
+		const bool bPipSwapTransition =
+			pFocus->pipPreferredFocus && pFocus->pipPreferredFocus == pFocus->focusWindow;
+		bool bDoFade = !bPipSwapTransition && win_has_game_id( pFocus->focusWindow );
 
 		if ( g_FadeOutDuration != 0 && !g_bFirstFrame && bDoFade )
 		{
@@ -5382,6 +6039,9 @@ destroy_win(xwayland_ctx_t *ctx, Window id, bool gone, bool fade)
 	if (ctx->currentKeyboardFocusWindow == id && gone)
 		ctx->currentKeyboardFocusWindow = None;
 
+	if ( gone )
+		clear_pip_refs_matching( &ctx->focus, [id]( steamcompmgr_win_t *w ) { return x11_win( w ) == id; } );
+
 	for ( auto &iter : g_VirtualConnectorFocuses )
 	{
 		global_focus_t *pFocus = &iter.second;
@@ -5398,6 +6058,9 @@ destroy_win(xwayland_ctx_t *ctx, Window id, bool gone, bool fade)
 			pFocus->overrideWindow = nullptr;
 		if (x11_win(pFocus->fadeWindow) == id && gone)
 			pFocus->fadeWindow = nullptr;
+
+		if ( gone )
+			clear_pip_refs_matching( pFocus, [id]( steamcompmgr_win_t *w ) { return x11_win( w ) == id; } );
 	}
 		
 	MakeFocusDirty();
@@ -6667,6 +7330,10 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 					pFocus->fadeWindow->xwayland().ctx == server->ctx.get())
 					pFocus->fadeWindow = nullptr;
 
+				clear_pip_refs_matching( pFocus, [&]( steamcompmgr_win_t *w ) {
+					return w->type == steamcompmgr_win_type_t::XWAYLAND && w->xwayland().ctx == server->ctx.get();
+				} );
+
 				if (pFocus->cursor &&
 					pFocus->cursor->getCtx() == server->ctx.get())
 					pFocus->cursor = nullptr;
@@ -6926,6 +7593,11 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 				}
 
 				if ( w == pFocus->overrideWindow )
+				{
+					hasRepaintNonBasePlane = true;
+				}
+
+				if ( w == pFocus->pipWindow )
 				{
 					hasRepaintNonBasePlane = true;
 				}
@@ -8171,6 +8843,8 @@ void steamcompmgr_check_xdg(bool vblank, uint64_t vblank_idx)
 				pFocus->overrideWindow = nullptr;
 			if (pFocus->fadeWindow && pFocus->fadeWindow->type == steamcompmgr_win_type_t::XDG)
 				pFocus->fadeWindow = nullptr;
+
+			clear_pip_refs_matching( pFocus, []( steamcompmgr_win_t *w ) { return w->type == steamcompmgr_win_type_t::XDG; } );
 		}
 		g_steamcompmgr_xdg_wins = wlserver_get_xdg_shell_windows();
 		MakeFocusDirty();
@@ -8323,6 +8997,9 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
 		char *ppMangoappArgv[] = { (char *)"mangoapp", NULL };
 		gamescope::Process::SpawnProcessInWatchdog( ppMangoappArgv, true );
 	}
+
+	if ( !g_sPipCommand.empty() )
+		EnablePiP( g_sPipCommand );
 }
 
 static gamescope::CTimerFunction g_FPSLimitVRRTimer{ []

@@ -34,6 +34,9 @@ struct focus_t
 	steamcompmgr_win_t				*notificationWindow = nullptr;
 	steamcompmgr_win_t				*overrideWindow = nullptr;
 	steamcompmgr_win_t				*overrideWindowMouse = nullptr;
+	steamcompmgr_win_t				*pipWindow = nullptr;
+	steamcompmgr_win_t				*pipCandidate = nullptr;
+	steamcompmgr_win_t				*pipPreferredFocus = nullptr;
 	bool			outdatedInteractiveFocus = false;
 	bool			bResetToCorner = false;
 	bool			bResetToCenter = false;

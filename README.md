@@ -47,6 +47,51 @@ meson install -C build/ --skip-subprojects
 * **Super + O** : Decrease FSR sharpness by 1
 * **Super + S** : Take screenshot (currently goes to `/tmp/gamescope_$DATE.png`)
 * **Super + G** : Toggle keyboard grab
+* **Super + P** : Toggle picture-in-picture (`gamescopectl pip_toggle`)
+* **Super + Shift + P** : Swap the main window and picture-in-picture (`gamescopectl pip_swap`)
+* **Super + Ctrl + P** : Toggle input focus between main and PiP (`gamescopectl pip_focus` / `pip_focus_main`)
+
+Use `--pip-command "program args..."` to launch a dedicated PiP client at startup (PiP starts enabled). Example:
+
+```sh
+gamescope --pip-command "mpv video.mp4" -- glxgears
+```
+
+Or control PiP after gamescope has started:
+
+```sh
+gamescopectl pip_enable "mpv video.mp4"
+gamescopectl pip_disable
+gamescopectl pip_toggle
+gamescopectl pip_swap
+gamescopectl pip_focus
+gamescopectl pip_focus_main
+```
+
+`pip_focus` / `pip_focus_main` route mouse and keyboard between the PiP and main windows **without** swapping layout (unlike `pip_swap`).
+
+Set the PiP frame aspect ratio with `--pip-aspect-ratio W:H` (default: match the output). Example:
+
+```sh
+gamescope --pip-aspect-ratio 16:9 --pip-command "mpv video.mp4" -- glxgears
+gamescopectl pip_aspect_ratio 16:9
+gamescopectl pip_aspect_ratio auto
+```
+
+Set the PiP size with `--pip-size-percent` (whole number 10–50; default: 20). Example:
+
+```sh
+gamescope --pip-size-percent 25 --pip-command "mpv video.mp4" -- glxgears
+gamescopectl pip_size_percent 25
+```
+
+Corner inset defaults to **auto**: it scales with size (20% inset at size 10, 5% at size 50). Override with `--pip-inset-percent` (whole number 0–40, or `auto`):
+
+```sh
+gamescope --pip-size-percent 50 --pip-inset-percent 5 --pip-command "mpv video.mp4" -- glxgears
+gamescopectl pip_inset_percent 8
+gamescopectl pip_inset_percent auto
+```
 
 ## Examples
 

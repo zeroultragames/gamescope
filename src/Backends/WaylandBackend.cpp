@@ -2975,6 +2975,20 @@ namespace gamescope
                     return;
                 }
 
+                case KEY_P:
+                {
+                    if ( !bPressed )
+                    {
+                        if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_SHIFT ] )
+                            SwapPiP();
+                        else if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_CTRL ] )
+                            TogglePipInputFocus();
+                        else
+                            TogglePiP();
+                    }
+                    return;
+                }
+
                 default:
                     break;
             }

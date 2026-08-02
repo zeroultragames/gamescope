@@ -745,7 +745,7 @@ namespace gamescope
 					if ( event.key.keysym.mod & KMOD_LGUI )
 					{
 						uint32_t key = SDLScancodeToLinuxKey( event.key.keysym.scancode );
-						const uint32_t shortcutKeys[] = {KEY_F, KEY_N, KEY_B, KEY_U, KEY_Y, KEY_I, KEY_O, KEY_S, KEY_G};
+						const uint32_t shortcutKeys[] = {KEY_F, KEY_N, KEY_B, KEY_U, KEY_Y, KEY_I, KEY_O, KEY_S, KEY_G, KEY_P};
 						const bool isShortcutKey = std::find(std::begin(shortcutKeys), std::end(shortcutKeys), key) != std::end(shortcutKeys);
 						if ( isShortcutKey )
 						{
@@ -797,6 +797,14 @@ namespace gamescope
 								SDL_Event event;
 								event.type = GetUserEventIndex( GAMESCOPE_SDL_EVENT_TITLE );
 								SDL_PushEvent( &event );
+								break;
+							case KEY_P:
+								if ( event.key.keysym.mod & KMOD_SHIFT )
+									SwapPiP();
+								else if ( event.key.keysym.mod & KMOD_CTRL )
+									TogglePipInputFocus();
+								else
+									TogglePiP();
 								break;
 							default:
 								handled = false;

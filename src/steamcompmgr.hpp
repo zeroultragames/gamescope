@@ -136,6 +136,26 @@ extern uint64_t g_lastWinSeq;
 void nudge_steamcompmgr( void );
 void force_repaint( void );
 
+// Toggles the Picture-in-Picture layer on/off (Super+P) and dirties focus so
+// it gets (re-)resolved on the next reroll. Centralized here so backends
+// don't need to poke g_bPiP + focus-dirtying directly.
+void TogglePiP( void );
+
+// Swaps the fullscreen main window with the PiP client (Super+Shift+P).
+// Promotes the PiP window to focus (input follows) and demotes the old main
+// into the PiP slot.
+void SwapPiP( void );
+
+// Route mouse/keyboard to the PiP window without swapping visual roles
+// (main stays fullscreen, PiP stays inset).
+void FocusPiPInput( void );
+
+// Return mouse/keyboard to the main window (clears PiP input focus).
+void FocusMainInput( void );
+
+// Toggle between FocusPiPInput and FocusMainInput (Super+Ctrl+P).
+void TogglePipInputFocus( void );
+
 extern void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns );
 struct wlr_surface *steamcompmgr_get_server_input_surface( size_t idx );
 wlserver_vk_swapchain_feedback* steamcompmgr_get_base_layer_swapchain_feedback();

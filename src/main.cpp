@@ -32,6 +32,7 @@
 #include "Utils/Version.h"
 #include "Utils/Process.h"
 #include "Utils/Defer.h"
+#include "Ratio.h"
 
 #include "backends.h"
 #include "refresh_rate.h"
@@ -74,6 +75,10 @@ const struct option *gamescope_options = (struct option[]){
 	{ "expose-wayland", no_argument, 0 },
 	{ "mouse-sensitivity", required_argument, nullptr, 's' },
 	{ "mangoapp", no_argument, nullptr, 0 },
+	{ "pip-command", required_argument, nullptr, 0 },
+	{ "pip-aspect-ratio", required_argument, nullptr, 0 },
+	{ "pip-size-percent", required_argument, nullptr, 0 },
+	{ "pip-inset-percent", required_argument, nullptr, 0 },
 	{ "adaptive-sync", no_argument, nullptr, 0 },
 
 	{ "backend", required_argument, nullptr, 0 },
@@ -216,6 +221,15 @@ const char usage[] =
 	"                                 Default: 1000 nits, Max: 10000 nits\n"
 	"  --framerate-limit              Set a simple framerate limit. Used as a divisor of the refresh rate, rounds down eg 60 / 59 -> 60fps, 60 / 25 -> 30fps. Default: 0, disabled.\n"
 	"  --mangoapp                     Launch with the mangoapp (mangohud) performance overlay enabled. You should use this instead of using mangohud on the game or gamescope.\n"
+	"  --pip-command                  Launch a command as the picture-in-picture client (enables PiP). Example: --pip-command \"mpv video.mp4\"\n"
+	"                                 After startup, use: gamescopectl pip_enable \"<command>\" / gamescopectl pip_disable\n"
+	"  --pip-aspect-ratio             PiP frame aspect ratio as W:H (e.g. 16:9). Default: match output aspect.\n"
+	"                                 After startup: gamescopectl pip_aspect_ratio 16:9 | auto\n"
+	"  --pip-size-percent             PiP size as a percent of output width/height (whole number 10-50). Default: 20.\n"
+	"                                 After startup: gamescopectl pip_size_percent 25\n"
+	"  --pip-inset-percent            PiP corner inset as a percent of output (whole number 0-40), or auto.\n"
+	"                                 Default: auto (scales with --pip-size-percent: 20 at size 10, 5 at size 50).\n"
+	"                                 After startup: gamescopectl pip_inset_percent 8 | auto\n"
 	"  --adaptive-sync                Enable adaptive sync if available (variable rate refresh)\n"
 	"\n"
 	"Nested mode options:\n"
@@ -286,6 +300,8 @@ const char usage[] =
 	"  Super + O                      decrease FSR sharpness by 1\n"
 	"  Super + S                      take a screenshot\n"
 	"  Super + G                      toggle keyboard grab\n"
+	"  Super + P                      toggle picture-in-picture\n"
+	"  Super + Shift + P              swap main window and picture-in-picture\n"
 	"";
 
 std::atomic< bool > g_bRun{true};
@@ -305,6 +321,13 @@ bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 
 bool g_bGrabbed = false;
+
+bool g_bPiP = false;
+
+std::string g_sPipCommand;
+float g_flPipAspectRatio = 0.f;
+int g_nPipSizePercent = 20;
+int g_nPipInsetPercent = -1;
 
 float g_mouseSensitivity = 1.0;
 
@@ -471,6 +494,60 @@ static float parse_float(const char *str, const char *optionName)
 		fprintf( stderr, "gamescope: invalid value for --%s, \"%s\" could not be interpreted as a real number\n", optionName, str );
 		exit(1);
 	}
+}
+
+bool ParsePipAspectRatioArg( std::string_view svArg, float *pOutAspect )
+{
+	if ( !pOutAspect )
+		return false;
+
+	if ( svArg.empty() || svArg == "auto" || svArg == "0" )
+	{
+		*pOutAspect = 0.f;
+		return true;
+	}
+
+	gamescope::Ratio<int> ratio( svArg );
+	if ( ratio.IsUndefined() || ratio.Num() <= 0 || ratio.Denom() <= 0 )
+		return false;
+
+	*pOutAspect = ratio.Num() / float( ratio.Denom() );
+	return true;
+}
+
+static bool ParseWholeNumberArg( std::string_view svArg, int nMin, int nMax, int *pOutValue )
+{
+	if ( !pOutValue || svArg.empty() )
+		return false;
+
+	int nValue = 0;
+	auto result = std::from_chars( svArg.begin(), svArg.end(), nValue );
+	if ( result.ec != std::errc{} || result.ptr != svArg.end() )
+		return false;
+	if ( nValue < nMin || nValue > nMax )
+		return false;
+
+	*pOutValue = nValue;
+	return true;
+}
+
+bool ParsePipSizePercentArg( std::string_view svArg, int *pOutPercent )
+{
+	return ParseWholeNumberArg( svArg, k_nPipSizePercentMin, k_nPipSizePercentMax, pOutPercent );
+}
+
+bool ParsePipInsetPercentArg( std::string_view svArg, int *pOutPercent )
+{
+	if ( !pOutPercent || svArg.empty() )
+		return false;
+
+	if ( svArg == "auto" )
+	{
+		*pOutPercent = -1;
+		return true;
+	}
+
+	return ParseWholeNumberArg( svArg, k_nPipInsetPercentMin, k_nPipInsetPercentMax, pOutPercent );
 }
 
 struct sigaction handle_signal_action = {};
@@ -827,6 +904,40 @@ int main(int argc, char **argv)
 					g_nCursorScaleHeight = parse_integer(optarg, opt_name);
 				} else if (strcmp(opt_name, "mangoapp") == 0) {
 					g_bLaunchMangoapp = true;
+				} else if (strcmp(opt_name, "pip-command") == 0) {
+					// Just stash the command here -- EnablePiP() (called from
+					// LaunchNestedChildren()) is what actually spawns the
+					// process and flips g_bPiP once it succeeds. Setting
+					// g_bPiP here too would race the initial focus reroll,
+					// which runs before LaunchNestedChildren() and would see
+					// PiP "on" with no process yet to back it.
+					g_sPipCommand = optarg;
+				} else if (strcmp(opt_name, "pip-aspect-ratio") == 0) {
+					float flAspect = 0.f;
+					if ( !ParsePipAspectRatioArg( optarg, &flAspect ) )
+					{
+						fprintf( stderr, "gamescope: invalid value for --pip-aspect-ratio, \"%s\" (expected W:H, auto, or 0)\n", optarg );
+						return 1;
+					}
+					g_flPipAspectRatio = flAspect;
+				} else if (strcmp(opt_name, "pip-size-percent") == 0) {
+					int nPercent = 0;
+					if ( !ParsePipSizePercentArg( optarg, &nPercent ) )
+					{
+						fprintf( stderr, "gamescope: invalid value for --pip-size-percent, \"%s\" (expected whole number %d-%d)\n",
+							optarg, k_nPipSizePercentMin, k_nPipSizePercentMax );
+						return 1;
+					}
+					g_nPipSizePercent = nPercent;
+				} else if (strcmp(opt_name, "pip-inset-percent") == 0) {
+					int nPercent = 0;
+					if ( !ParsePipInsetPercentArg( optarg, &nPercent ) )
+					{
+						fprintf( stderr, "gamescope: invalid value for --pip-inset-percent, \"%s\" (expected whole number %d-%d, or auto)\n",
+							optarg, k_nPipInsetPercentMin, k_nPipInsetPercentMax );
+						return 1;
+					}
+					g_nPipInsetPercent = nPercent;
 				} else if (strcmp(opt_name, "allow-deferred-backend") == 0) {
 					g_bAllowDeferredBackend = true;
 				} else if (strcmp(opt_name, "keep-alive") == 0) {
