@@ -290,7 +290,6 @@ struct FrameInfo_t
 	bool useFSRLayer0;
 	bool useNISLayer0;
 	bool bFadingOut;
-	bool bHasPipLayer;
 	BlurMode blurLayer0;
 	int blurRadius;
 
