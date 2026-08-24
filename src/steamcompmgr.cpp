@@ -2760,6 +2760,10 @@ paint_all( global_focus_t *pFocus, bool async )
 	if ( pip && pip != w && pip != override &&
 		 frameInfo.layerCount < k_nMaxLayers - 2 )
 	{
+		// Mark intent before painting so DRM can force the composite path even
+		// if this frame's PiP texture is not ready yet.
+		frameInfo.bHasPipLayer = true;
+
 		int nLayerBeforePip = frameInfo.layerCount;
 		paint_window( pip, pip, &frameInfo, pFocus->cursor, PaintWindowFlag::NoFilter );
 		if ( frameInfo.layerCount > nLayerBeforePip )
@@ -3708,7 +3712,7 @@ static inline void
 RequestPipFocusReroll()
 {
 	MakeFocusDirty();
-	nudge_steamcompmgr();
+	force_repaint();
 }
 
 // Super+P: show/hide the PiP layer without touching the underlying process.
@@ -7601,6 +7605,9 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 				if ( w == pFocus->pipWindow )
 				{
 					hasRepaintNonBasePlane = true;
+					// PiP updates must repaint under VRR, which otherwise only
+					// watches hasRepaint (base-plane commits).
+					hasRepaint = true;
 				}
 
 				if ( w->isSteamStreamingClientVideo && pFocus->focusWindow && pFocus->focusWindow->isSteamStreamingClient )
@@ -9686,6 +9693,37 @@ steamcompmgr_main(int argc, char **argv)
 		for ( auto &iter : g_VirtualConnectorFocuses )
 		{
 			global_focus_t *pPaintFocus = &iter.second;
+
+			// Virtual connector focuses each paint to their own output on
+			// Wayland/OpenVR. On DRM there is a single physical connector, so
+			// painting every focus would let the last one overwrite PiP.
+			if ( !GetBackend()->UsesVirtualConnectors() )
+			{
+				global_focus_t *pCurrentPaintFocus = GetCurrentFocus();
+
+				// Per-app virtual focus keys still exist on DRM even though the
+				// connector key stays 0, so prefer the focus entry that owns
+				// the visible game over the stale single-output slot.
+				if ( !gamescope::VirtualConnectorIsSingleOutput() )
+				{
+					for ( auto &focusIter : g_VirtualConnectorFocuses )
+					{
+						global_focus_t *pCandidate = &focusIter.second;
+						if ( !pCandidate->focusWindow )
+							continue;
+
+						if ( !pCurrentPaintFocus ||
+							 ( win_has_game_id( pCandidate->focusWindow ) &&
+							   !win_has_game_id( pCurrentPaintFocus->focusWindow ) ) )
+						{
+							pCurrentPaintFocus = pCandidate;
+						}
+					}
+				}
+
+				if ( !pCurrentPaintFocus || pPaintFocus != pCurrentPaintFocus )
+					continue;
+			}
 
 			if ( vblank )
 			{

@@ -3565,6 +3565,26 @@ namespace gamescope
 			return vulkan_has_drm_props();
 		}
 
+		// Inset layers (PiP, some override-redirect popups) rely on compositor
+		// math that direct KMS plane scanout cannot reproduce reliably.
+		static bool FrameHasInsetLayer( const FrameInfo_t *pFrameInfo )
+		{
+			for ( int i = 0; i < pFrameInfo->layerCount; i++ )
+			{
+				const FrameInfo_t::Layer_t *pLayer = &pFrameInfo->layers[ i ];
+				if ( !pLayer->tex || pLayer->zpos != g_zposOverride )
+					continue;
+
+				const float flDisplayW = pLayer->tex->width() / pLayer->scale.x;
+				const float flDisplayH = pLayer->tex->height() / pLayer->scale.y;
+
+				if ( flDisplayW < g_nOutputWidth * 0.95f || flDisplayH < g_nOutputHeight * 0.95f )
+					return true;
+			}
+
+			return false;
+		}
+
 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync )
 		{
 			static uint64_t s_ulLastTime = get_time_in_nanos();
@@ -3603,7 +3623,13 @@ namespace gamescope
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= pFrameInfo->bHasPipLayer;
+			bNeedsFullComposite |= FrameHasInsetLayer( pFrameInfo );
 			bNeedsFullComposite |= !g_reshade_effect.empty();
+
+			// Partial composition only composites overlay layers onto the base
+			// plane; inset PiP geometry must go through the full composite path.
+			if ( bNeedsFullComposite )
+				bWantsPartialComposite = false;
 
 			if ( g_bOutputHDREnabled )
 			{
