@@ -2768,6 +2768,7 @@ paint_all( global_focus_t *pFocus, bool async )
 			if ( layer->tex )
 			{
 				ApplyPipLayerLayout( layer );
+				frameInfo.bHasPipLayer = true;
 				if ( PipInputFocusActive( pFocus ) && pFocus == pCurrentFocus )
 					update_touch_scaling( &frameInfo );
 			}
