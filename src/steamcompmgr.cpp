@@ -4352,7 +4352,15 @@ found:;
 
 		if ( gamescope::cv_backend_virtual_connector_strategy == gamescope::VirtualConnectorStrategies::SteamControlled )
 		{
-			if ( !( win_has_game_id( w ) || window_is_steam( w ) || w->isSteamStreamingClient ) )	
+			// SteamControlled normally hides non-Steam/non-game windows so they
+			// never take primary focus. Dedicated --pip-command / pip_enable
+			// clients (e.g. glxgears) have no appID and would be invisible to
+			// ResolvePipWindow() unless we keep them in the candidate list.
+			// is_focus_priority_greater() still deprioritizes them for primary
+			// focus; they are also omitted from the focusable-* atoms reported
+			// to Steam below.
+			const bool bPipClient = g_bPiP && window_belongs_to_pip_process( w );
+			if ( !( win_has_game_id( w ) || window_is_steam( w ) || w->isSteamStreamingClient || bPipClient ) )
 				continue;
 		}
 
@@ -4796,10 +4804,13 @@ determine_and_apply_focus( global_focus_t *pFocus )
 			continue;
 
 		// Exclude windows that are useless (1x1), skip taskbar + pager or override redirect windows
-		// from the reported focusable windows to Steam.
+		// from the reported focusable windows to Steam. Also hide dedicated
+		// PiP clients -- they are only in the focus candidate list so
+		// ResolvePipWindow() can find them under SteamControlled.
 		if ( win_is_useless( focusable_window ) ||
 			win_skip_and_not_fullscreen( focusable_window ) ||
-			focusable_window->xwayland().a.override_redirect )
+			focusable_window->xwayland().a.override_redirect ||
+			window_belongs_to_pip_process( focusable_window ) )
 			continue;
 
 		unsigned int unAppID = focusable_window->appID;
