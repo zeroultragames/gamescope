@@ -49,7 +49,7 @@ meson install -C build/ --skip-subprojects
 * **Super + G** : Toggle keyboard grab
 * **Super + P** : Toggle picture-in-picture (`gamescopectl pip_toggle`)
 * **Super + Shift + P** : Swap the main window and picture-in-picture (`gamescopectl pip_swap`)
-* **Super + Ctrl + P** : Toggle input focus between main and PiP (`gamescopectl pip_focus` / `pip_focus_main`)
+* **Super + Ctrl + P** : Toggle input focus between main and PiP (`gamescopectl pip_focus_pip` / `pip_focus_main`)
 
 Use `--pip-command "program args..."` to launch a dedicated PiP client at startup (PiP starts enabled). Example:
 
@@ -64,11 +64,11 @@ gamescopectl pip_enable "mpv video.mp4"
 gamescopectl pip_disable
 gamescopectl pip_toggle
 gamescopectl pip_swap
-gamescopectl pip_focus
+gamescopectl pip_focus_pip
 gamescopectl pip_focus_main
 ```
 
-`pip_focus` / `pip_focus_main` route mouse and keyboard between the PiP and main windows **without** swapping layout (unlike `pip_swap`).
+`pip_focus_pip` / `pip_focus_main` route mouse and keyboard between the PiP and main windows **without** swapping layout (unlike `pip_swap`).
 
 Set the PiP frame aspect ratio with `--pip-aspect-ratio W:H` (default: match the output). Example:
 

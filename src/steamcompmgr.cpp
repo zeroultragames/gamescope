@@ -3820,8 +3820,8 @@ static gamescope::ConCommand cc_pip_swap(
 		SwapPiP();
 	} );
 
-static gamescope::ConCommand cc_pip_focus(
-	"pip_focus",
+static gamescope::ConCommand cc_pip_focus_pip(
+	"pip_focus_pip",
 	"Route mouse and keyboard to the PiP window without swapping layout",
 	[]( std::span<std::string_view> )
 	{
