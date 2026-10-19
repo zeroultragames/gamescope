@@ -2532,8 +2532,7 @@ gamescope::ConVar<bool> cv_paint_mura_plane{ "paint_mura_plane", true };
 // The PiP rectangle is the largest box of the configured aspect ratio that
 // fits inside the budget, anchored to the lower-right with that inset.
 
-static float
-PipInsetFraction()
+static float PipInsetFraction()
 {
 	if ( g_nPipInsetPercent >= 0 )
 		return g_nPipInsetPercent / 100.f;
@@ -2547,8 +2546,7 @@ PipInsetFraction()
 
 // Positions and scales an already-painted PiP layer into its fixed
 // lower-right corner geometry.
-static void
-ApplyPipLayerLayout( FrameInfo_t::Layer_t *layer )
+static void ApplyPipLayerLayout( FrameInfo_t::Layer_t *layer )
 {
 	assert( g_nPipSizePercent >= k_nPipSizePercentMin && g_nPipSizePercent <= k_nPipSizePercentMax );
 	assert( g_nPipInsetPercent == -1
@@ -2757,8 +2755,10 @@ paint_all( global_focus_t *pFocus, bool async )
 		pFocus->pipWindow = nullptr;
 
 	steamcompmgr_win_t *pip = pFocus->pipWindow;
-	if ( pip && pip != w && pip != override &&
-		 frameInfo.layerCount < k_nMaxLayers - 2 )
+	if ( pip &&
+	     pip != w &&
+	     pip != override &&
+	     frameInfo.layerCount < k_nMaxLayers - 2 )
 	{
 		int nLayerBeforePip = frameInfo.layerCount;
 		paint_window( pip, pip, &frameInfo, pFocus->cursor, PaintWindowFlag::NoFilter );
@@ -3563,8 +3563,7 @@ win_is_disabled( steamcompmgr_win_t *w )
 // (opens and parses a /proc/<pid>/stat file per generation), so callers
 // should go through window_belongs_to_pip_process()'s cache rather than
 // calling this directly on a hot path.
-static bool
-pid_is_descendant_of( pid_t pid, pid_t ancestor )
+static bool pid_is_descendant_of( pid_t pid, pid_t ancestor )
 {
 	if ( pid <= 0 || ancestor <= 0 )
 		return false;
@@ -3607,8 +3606,7 @@ pid_is_descendant_of( pid_t pid, pid_t ancestor )
 // can invalidate it is the tracked PiP process pid changing, which only
 // happens once, at startup, so we detect that by stashing the pid the cache
 // was last computed against.
-static bool
-window_belongs_to_pip_process( steamcompmgr_win_t *w )
+static bool window_belongs_to_pip_process( steamcompmgr_win_t *w )
 {
 	if ( !w || g_nPipProcessPid <= 0 )
 		return false;
@@ -3622,8 +3620,7 @@ window_belongs_to_pip_process( steamcompmgr_win_t *w )
 	return w->bPipMembershipCached;
 }
 
-static bool
-is_valid_pip_window( steamcompmgr_win_t *w, steamcompmgr_win_t *focusWindow )
+static bool is_valid_pip_window( steamcompmgr_win_t *w, steamcompmgr_win_t *focusWindow )
 {
 	return w
 		&& w != focusWindow
@@ -3637,8 +3634,7 @@ is_valid_pip_window( steamcompmgr_win_t *w, steamcompmgr_win_t *focusWindow )
 // outdatedInteractiveFocus + MakeFocusDirty() mechanism used for the primary
 // focus window (see pick_primary_focus_and_override()) so that a fresh
 // commit triggers a re-resolve instead of the window being stuck unshown.
-static bool
-is_ready_pip_window( steamcompmgr_win_t *w )
+static bool is_ready_pip_window( steamcompmgr_win_t *w )
 {
 	if ( window_has_commits( w ) )
 		return true;
@@ -3650,8 +3646,7 @@ is_ready_pip_window( steamcompmgr_win_t *w )
 // Picks the window (if any) to show in the PiP layer. Takes the
 // already-sorted global focus candidate list built by the caller
 // (determine_and_apply_focus()) to avoid building and sorting it twice.
-static steamcompmgr_win_t *
-ResolvePipWindow( global_focus_t *pFocus, const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
+static steamcompmgr_win_t * ResolvePipWindow( global_focus_t *pFocus, const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
 {
 	if ( !pFocus || !g_bPiP )
 		return nullptr;
@@ -3686,8 +3681,7 @@ ResolvePipWindow( global_focus_t *pFocus, const std::vector<steamcompmgr_win_t*>
 // destroy/teardown paths so pipWindow/pipCandidate/pipPreferredFocus never
 // dangle. Callers are still responsible for calling MakeFocusDirty() as usual.
 template < typename MatchFn >
-static void
-clear_pip_refs_matching( focus_t *pFocus, MatchFn &&fnMatches )
+static void clear_pip_refs_matching( focus_t *pFocus, MatchFn &&fnMatches )
 {
 	if ( !pFocus )
 		return;
@@ -3703,8 +3697,7 @@ clear_pip_refs_matching( focus_t *pFocus, MatchFn &&fnMatches )
 // Common tail of every PiP state change (enable/disable/toggle/swap): the
 // change only takes visible effect once focus is rerolled, so dirty it and
 // wake the compositor thread rather than waiting on some unrelated event.
-static inline void
-RequestPipFocusReroll()
+static inline void RequestPipFocusReroll()
 {
 	MakeFocusDirty();
 	force_repaint();
@@ -3724,8 +3717,7 @@ void TogglePiP()
 // pip_enable process (if any), forgets the command, and turns PiP off.
 // Distinct from TogglePiP()/Super+P, which only hides the layer and leaves
 // the process and g_sPipCommand alone.
-static void
-DisablePiP()
+static void DisablePiP()
 {
 	// Already fully idle (never enabled, or a previous DisablePiP() already
 	// tore it down) -- bail out before dirtying focus/nudging the compositor
@@ -3756,8 +3748,7 @@ DisablePiP()
 
 // pip_enable / --pip-command: (re-)launches the dedicated PiP client via
 // `sh -c <command>`, replacing any previously-running one.
-static void
-EnablePiP( std::string_view svCommand )
+static void EnablePiP( std::string_view svCommand )
 {
 	if ( svCommand.empty() )
 		return;
@@ -3977,8 +3968,9 @@ void TogglePipInputFocus()
 // If a sticky PiP-swap preferred focus is still focusable, promote it to
 // focusWindow so input (XSetInputFocus / wlserver) follows the swapped main
 // window. Returns true when applied.
-static bool
-try_apply_pip_preferred_focus( focus_t *pFocus, const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
+static bool try_apply_pip_preferred_focus(
+        focus_t *pFocus,
+        const std::vector<steamcompmgr_win_t*> &vecPossibleFocusWindows )
 {
 	if ( !pFocus || !pFocus->pipPreferredFocus )
 		return false;
@@ -4007,8 +3999,9 @@ try_apply_pip_preferred_focus( focus_t *pFocus, const std::vector<steamcompmgr_w
 // those call try_apply_pip_preferred_focus() on the local focus_t so the
 // promotion is visible to local XSetInputFocus/inputFocus derivation, not
 // just the global focus used for paint/wlserver.
-static inline void
-sync_pip_preferred_focus( focus_t *pLocalFocus, const global_focus_t *pFocus )
+static inline void sync_pip_preferred_focus(
+		focus_t *pLocalFocus,
+		const global_focus_t *pFocus )
 {
 	pLocalFocus->pipPreferredFocus = pFocus->pipPreferredFocus;
 }
@@ -4347,15 +4340,10 @@ found:;
 
 		if ( gamescope::cv_backend_virtual_connector_strategy == gamescope::VirtualConnectorStrategies::SteamControlled )
 		{
-			// SteamControlled normally hides non-Steam/non-game windows so they
-			// never take primary focus. Dedicated --pip-command / pip_enable
-			// clients (e.g. glxgears) have no appID and would be invisible to
-			// ResolvePipWindow() unless we keep them in the candidate list.
-			// is_focus_priority_greater() still deprioritizes them for primary
-			// focus; they are also omitted from the focusable-* atoms reported
-			// to Steam below.
-			const bool bPipClient = g_bPiP && window_belongs_to_pip_process( w );
-			if ( !( win_has_game_id( w ) || window_is_steam( w ) || w->isSteamStreamingClient || bPipClient ) )
+			if ( !( win_has_game_id( w ) ||
+		        window_is_steam( w ) ||
+		        w->isSteamStreamingClient ||
+		        (g_bPiP && window_belongs_to_pip_process( w )) ) )
 				continue;
 		}
 
@@ -7611,9 +7599,7 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 				if ( w == pFocus->pipWindow )
 				{
 					hasRepaintNonBasePlane = true;
-					// PiP updates must repaint under VRR, which otherwise only
-					// watches hasRepaint (base-plane commits).
-					hasRepaint = true;
+					hasRepaint = true; // PiP updates must repaint under VRR, which otherwise only watches hasRepaint (base-plane commits).
 				}
 
 				if ( w->isSteamStreamingClientVideo && pFocus->focusWindow && pFocus->focusWindow->isSteamStreamingClient )
