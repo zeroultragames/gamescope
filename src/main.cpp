@@ -141,6 +141,7 @@ const struct option *gamescope_options = (struct option[]){
 	{ "composite-debug", no_argument, nullptr, 0 },
 	{ "disable-xres", no_argument, nullptr, 'x' },
 	{ "fade-out-duration", required_argument, nullptr, 0 },
+	{ "force-composition-rotation", no_argument, nullptr, 0 },
 	{ "force-orientation", required_argument, nullptr, 0 },
 	{ "force-windows-fullscreen", no_argument, nullptr, 0 },
 
@@ -206,6 +207,7 @@ const char usage[] =
 	"  -e, --steam                    enable Steam integration\n"
 	"  --xwayland-count               create N xwayland servers\n"
 	"  --prefer-vk-device             prefer Vulkan device for compositing (ex: 1002:7300)\n"
+	"  --force-composition-rotation   always rotate the output in the compositor instead of at scanout (autodetected otherwise)\n"
 	"  --force-orientation            rotate the internal display (left, right, normal, upsidedown)\n"
 	"  --force-windows-fullscreen     force windows inside of gamescope to be the size of the nested display (fullscreen)\n"
 	"  --cursor-scale-height          if specified, sets a base output height to linearly scale the cursor against.\n"
@@ -389,6 +391,9 @@ static gamescope::GamescopeModeGeneration parse_gamescope_mode_generation( const
 	}
 }
 
+bool g_bForceCompositionRotation = false;
+uint32_t g_uOutputRotation = 0;
+
 GamescopePanelOrientation g_DesiredInternalOrientation = GAMESCOPE_PANEL_ORIENTATION_AUTO;
 static GamescopePanelOrientation force_orientation(const char *str)
 {
@@ -466,6 +471,16 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 		fprintf( stderr, "gamescope: invalid value for --backend\n" );
 		exit(1);
 	}
+}
+
+static enum gamescope::GamescopeBackend auto_select_backend()
+{
+	if ( getenv( "WAYLAND_DISPLAY" ) != NULL )
+		return gamescope::GamescopeBackend::Wayland;
+	else if ( getenv( "DISPLAY" ) != NULL )
+		return gamescope::GamescopeBackend::SDL;
+	else
+		return gamescope::GamescopeBackend::DRM;
 }
 
 static int parse_integer(const char *str, const char *optionName)
@@ -795,8 +810,6 @@ int main(int argc, char **argv)
 
 	gamescope::GamescopeBackend eCurrentBackend = gamescope::GamescopeBackend::Auto;
 
-	gamescope::PrintVersion();
-
 	int o;
 	int opt_index = -1;
 	while ((o = getopt_long(argc, argv, gamescope_optstring, gamescope_options, &opt_index)) != -1)
@@ -853,10 +866,11 @@ int main(int argc, char **argv)
 			case 0: // long options without a short option
 				opt_name = gamescope_options[opt_index].name;
 				if (strcmp(opt_name, "help") == 0) {
+					gamescope::PrintVersion();
 					fprintf(stderr, "%s", usage);
 					return 0;
 				} else if (strcmp(opt_name, "version") == 0) {
-					// We always print the version to stderr anyway.
+					gamescope::PrintVersion();
 					return 0;
 				} else if (strcmp(opt_name, "debug-layers") == 0) {
 					g_bDebugLayers = true;
@@ -875,6 +889,8 @@ int main(int argc, char **argv)
 					gamescope::cv_touch_click_mode = (gamescope::TouchClickMode) parse_integer( optarg, opt_name );
 				} else if (strcmp(opt_name, "generate-drm-mode") == 0) {
 					g_eGamescopeModeGeneration = parse_gamescope_mode_generation( optarg );
+				} else if (strcmp(opt_name, "force-composition-rotation") == 0) {
+					g_bForceCompositionRotation = true;
 				} else if (strcmp(opt_name, "force-orientation") == 0) {
 					g_DesiredInternalOrientation = force_orientation( optarg );
 				} else if (strcmp(opt_name, "sharpness") == 0 ||
@@ -961,6 +977,17 @@ int main(int argc, char **argv)
 		}
 	}
 
+	// Steam preloads its overlay into us, but only the SDL backend can draw it.
+	// A ConVar or script override comes too late to unload it.
+	gamescope::GamescopeBackend eLaunchBackend = eCurrentBackend;
+	if ( eLaunchBackend == gamescope::GamescopeBackend::Auto )
+		eLaunchBackend = auto_select_backend();
+	if ( eLaunchBackend != gamescope::GamescopeBackend::SDL )
+		gamescope::Process::RestartWithoutSteamOverlay( argv );
+
+	// Print this after the re-exec, so we only announce ourselves once.
+	gamescope::PrintVersion();
+
 	if ( gamescope::Process::HasCapSysNice() )
 	{
 		gamescope::Process::SetNice( -20 );
@@ -1033,12 +1060,7 @@ int main(int argc, char **argv)
 
 	if ( eCurrentBackend == gamescope::GamescopeBackend::Auto )
 	{
-		if ( g_pOriginalWaylandDisplay != NULL )
-			eCurrentBackend = gamescope::GamescopeBackend::Wayland;
-		else if ( g_pOriginalDisplay != NULL )
-			eCurrentBackend = gamescope::GamescopeBackend::SDL;
-		else
-			eCurrentBackend = gamescope::GamescopeBackend::DRM;
+		eCurrentBackend = auto_select_backend();
 	}
 
 	if ( g_pOriginalWaylandDisplay != NULL )

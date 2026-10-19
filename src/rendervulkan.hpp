@@ -421,6 +421,7 @@ void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
+uint32_t vulkan_get_rgb10_capture_format( void );
 
 void vulkan_present_to_window( void );
 
@@ -1013,5 +1014,7 @@ void vulkan_wait_idle();
 
 // Whether the driver implements VK_EXT_physical_device_drm
 bool vulkan_has_drm_props();
+
+bool vulkan_has_drm_modifiers_for_features(VkFormat format, VkFormatFeatureFlags features);
 
 extern CVulkanDevice g_device;

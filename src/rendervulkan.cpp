@@ -3305,8 +3305,14 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 
 	uint32_t uDRMFormat = pOutput->uOutputFormat;
 
+	// Output images are physical-oriented; the panel scans out unrotated.
+	uint32_t uOutputWidth = g_nOutputWidth;
+	uint32_t uOutputHeight = g_nOutputHeight;
+	if ( g_uOutputRotation & 1u )
+		std::swap( uOutputWidth, uOutputHeight );
+
 	pOutput->outputImages[0] = new CVulkanTexture();
-	bool bSuccess = pOutput->outputImages[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
+	bool bSuccess = pOutput->outputImages[0]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3314,7 +3320,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	}
 
 	pOutput->outputImages[1] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
+	bSuccess = pOutput->outputImages[1]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3322,7 +3328,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	}
 
 	pOutput->outputImages[2] = new CVulkanTexture();
-	bSuccess = pOutput->outputImages[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uDRMFormat, outputImageflags );
+	bSuccess = pOutput->outputImages[2]->BInit( uOutputWidth, uOutputHeight, 1u, uDRMFormat, outputImageflags );
 	if ( bSuccess != true )
 	{
 		vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3337,7 +3343,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		uint32_t uPartialDRMFormat = pOutput->uOutputFormatOverlay;
 
 		pOutput->outputImagesPartialOverlay[0] = new CVulkanTexture();
-		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
+		bool bSuccess = pOutput->outputImagesPartialOverlay[0]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[0].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3345,7 +3351,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		}
 
 		pOutput->outputImagesPartialOverlay[1] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
+		bSuccess = pOutput->outputImagesPartialOverlay[1]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[1].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3353,7 +3359,7 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 		}
 
 		pOutput->outputImagesPartialOverlay[2] = new CVulkanTexture();
-		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( g_nOutputWidth, g_nOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
+		bSuccess = pOutput->outputImagesPartialOverlay[2]->BInit( uOutputWidth, uOutputHeight, 1u, uPartialDRMFormat, outputImageflags, nullptr, 0, 0, pOutput->outputImages[2].get() );
 		if ( bSuccess != true )
 		{
 			vk_log.errorf( "failed to allocate buffer for KMS" );
@@ -3644,6 +3650,7 @@ static gamescope::Rc<CVulkanTexture> acquire_pooled_texture( auto& pool, uint32_
 			textureFlags.bMappable = true;
 			textureFlags.bTransferDst = true;
 			textureFlags.bStorage = true;
+			textureFlags.bSampled = true; // required for RGB-to-NV12 shader to sample this texture
 			if (exportable || drmFormat == DRM_FORMAT_NV12) {
 				textureFlags.bExportable = true;
 				textureFlags.bLinear = true; // TODO: support multi-planar DMA-BUF export via PipeWire
@@ -3683,6 +3690,25 @@ gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uin
 	return texture;
 }
 
+// XRGB2101010 storage images are an optional Vulkan feature that NVIDIA hardware
+// doesn't support, and imageStore lands in XBGR order there, swapping R/B.
+uint32_t vulkan_get_rgb10_capture_format( void )
+{
+	static uint32_t s_uFormat = []()
+	{
+		// Pooled capture textures are mappable, hence linear-tiled.
+		VkFormatProperties props;
+		g_device.vk.GetPhysicalDeviceFormatProperties( g_device.physDev(), VK_FORMAT_A2R10G10B10_UNORM_PACK32, &props );
+		constexpr VkFormatFeatureFlags uNeeded = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+		if ( ( props.linearTilingFeatures & uNeeded ) == uNeeded )
+			return DRM_FORMAT_XRGB2101010;
+
+		vk_log.infof( "XRGB2101010 lacks linear storage/sampled support, capturing as XBGR2101010" );
+		return DRM_FORMAT_XBGR2101010;
+	}();
+	return s_uFormat;
+}
+
 // Internal display's native brightness.
 float g_flInternalDisplayBrightnessNits = 500.0f;
 
@@ -3708,10 +3734,13 @@ struct BlitPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo)
+	uint32_t u_rotation;
+
+	explicit BlitPushData_t(const struct FrameInfo_t *frameInfo, uint32_t rotation = 0)
 	{
 		u_shaderFilter = 0;
 		u_alphaMode = 0;
+		u_rotation = rotation;
 
 		for (int i = 0; i < frameInfo->layerCount; i++) {
 			const FrameInfo_t::Layer_t *layer = &frameInfo->layers[i];
@@ -3756,6 +3785,7 @@ struct BlitPushData_t
 		opacity[0] = 1.0f;
         u_shaderFilter = (uint32_t)GamescopeUpscaleFilter::LINEAR;
 		u_alphaMode = 0;
+		u_rotation = 0;
 		ctm[0] = glm::mat3x4
 		{
 			1, 0, 0, 0,
@@ -3842,10 +3872,13 @@ struct RcasPushData_t
     float u_itmSdrNits; // unset
     float u_itmTargetNits; // unset
 
-	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness)
+	uint32_t u_rotation;
+
+	RcasPushData_t(const struct FrameInfo_t *frameInfo, float sharpness, uint32_t rotation = 0)
 	{
 		uvec4_t tmp;
 		FsrRcasCon(&tmp.x, sharpness);
+		u_rotation = rotation;
 		u_layer0Offset.x = uint32_t(int32_t(frameInfo->layers[0].offset.x));
 		u_layer0Offset.y = uint32_t(int32_t(frameInfo->layers[0].offset.y));
 		u_borderMask = frameInfo->borderMask() >> 1u;
@@ -4036,6 +4069,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	else
 		compositeImage = partial ? g_output.outputImagesPartialOverlay[ g_output.nOutImage ] : g_output.outputImages[ g_output.nOutImage ];
 
+	// Overrides (screenshots, upscale cache) are logical-sized, so never rotated.
+	const uint32_t uOutputRotation = pOutputOverride ? 0u : g_uOutputRotation;
+
 	auto cmdBuffer = pInCommandBuffer ? std::move( pInCommandBuffer ) : g_device.commandBuffer();
 
 	for (uint32_t i = 0; i < EOTF_Count; i++)
@@ -4070,7 +4106,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->setSamplerUnnormalized(0, false);
 		cmdBuffer->setSamplerNearest(0, false);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, g_upscaleFilterSharpness / 10.0f);
+		cmdBuffer->uploadConstants<RcasPushData_t>(frameInfo, g_upscaleFilterSharpness / 10.0f, uOutputRotation);
 
 		cmdBuffer->dispatch(div_roundup(currentOutputWidth, pixelsPerGroup), div_roundup(currentOutputHeight, pixelsPerGroup));
 	}
@@ -4113,7 +4149,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, nisFrameInfo.layerCount, nisFrameInfo.ycbcrMask(), 0u, nisFrameInfo.colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), &nisFrameInfo);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(&nisFrameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
 
@@ -4139,7 +4175,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 			cmdBuffer->setSamplerUnnormalized(i, true);
 			cmdBuffer->setSamplerNearest(i, false);
 		}
-		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
 
 		int pixelsPerGroup = 8;
 
@@ -4163,7 +4199,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 		cmdBuffer->bindPipeline( g_device.pipeline(SHADER_TYPE_BLIT, frameInfo->layerCount, frameInfo->ycbcrMask(), 0u, frameInfo->colorspaceMask(), outputTF ));
 		bind_all_layers(cmdBuffer.get(), frameInfo);
 		cmdBuffer->bindTarget(compositeImage);
-		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo);
+		cmdBuffer->uploadConstants<BlitPushData_t>(frameInfo, uOutputRotation);
 
 		const int pixelsPerGroup = 8;
 
@@ -4236,6 +4272,36 @@ bool vulkan_has_drm_props()
 {
 	for (const auto& ext : g_device.supportedExtensions()) {
 		if ( strcmp(ext.extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0 )
+			return true;
+	}
+
+	return false;
+}
+
+bool vulkan_has_drm_modifiers_for_features(VkFormat format, VkFormatFeatureFlags features)
+{
+	if ( !g_device.supportsModifiers() )
+		return false;
+
+	VkDrmFormatModifierPropertiesListEXT modifierPropList = {
+		.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+	};
+	VkFormatProperties2 formatProps = {
+		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+		.pNext = &modifierPropList,
+	};
+
+	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+	if ( modifierPropList.drmFormatModifierCount == 0 )
+		return false;
+
+	std::vector<VkDrmFormatModifierPropertiesEXT> modifierProps(modifierPropList.drmFormatModifierCount);
+	modifierPropList.pDrmFormatModifierProperties = modifierProps.data();
+	g_device.vk.GetPhysicalDeviceFormatProperties2( g_device.physDev(), format, &formatProps );
+
+	for ( size_t j = 0; j < modifierProps.size(); j++ ) {
+		if ( ( modifierProps[j].drmFormatModifierTilingFeatures & features ) == features )
 			return true;
 	}
 

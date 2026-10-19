@@ -55,12 +55,11 @@
 
 #include "gamescope-control-protocol.h"
 
-static constexpr bool k_bUseCursorPlane = false;
-
 extern int g_nPreferredOutputWidth;
 extern int g_nPreferredOutputHeight;
 
 gamescope::ConVar<bool> cv_drm_single_plane_optimizations( "drm_single_plane_optimizations", true, "Whether or not to enable optimizations for single plane usage." );
+gamescope::ConVar<bool> cv_drm_cursor_plane( "drm_cursor_plane", false, "Scan out the cursor with the DRM cursor plane instead of forcing composition while a cursor is visible. Known driver issues on AMDGPU." );
 
 gamescope::ConVar<bool> cv_drm_debug_disable_shaper_and_3dlut( "drm_debug_disable_shaper_and_3dlut", false, "Shaper + 3DLUT chicken bit. (Force disable/DEFAULT, no logic change)" );
 gamescope::ConVar<bool> cv_drm_debug_disable_degamma_tf( "drm_debug_disable_degamma_tf", false, "Degamma chicken bit. (Forces DEGAMMA_TF to DEFAULT, does not affect other logic)" );
@@ -267,6 +266,7 @@ namespace gamescope
 
 		static std::optional<CDRMAtomicProperty> Instantiate( const char *pszName, CDRMAtomicObject *pObject, const DRMObjectRawProperties& rawProperties );
 
+		uint32_t GetPropertyId() const { return m_uPropertyId; }
 		uint64_t GetPendingValue() const { return m_ulPendingValue; }
 		uint64_t GetCurrentValue() const { return m_ulCurrentValue; }
 		uint64_t GetInitialValue() const { return m_ulInitialValue; }
@@ -699,9 +699,15 @@ static bool get_plane_formats( struct drm_t *drm, gamescope::CDRMPlane *pPlane, 
 
 static uint32_t pick_plane_format( const struct wlr_drm_format_set *formats, uint32_t Xformat, uint32_t Aformat )
 {
+	const VkFormatFeatureFlags neededFeatures = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
 	uint32_t result = DRM_FORMAT_INVALID;
 	for ( size_t i = 0; i < formats->len; i++ ) {
 		uint32_t fmt = formats->formats[i].format;
+
+		// Skip formats that we cannot use with the Vulkan device
+		if ( !vulkan_has_drm_modifiers_for_features( DRMFormatToVulkan(fmt, false), neededFeatures ) )
+			continue;
+
 		if ( fmt == Xformat ) {
 			// Prefer formats without alpha channel for main plane
 			result = fmt;
@@ -1934,7 +1940,7 @@ LiftoffStateCacheEntry FrameInfoToLiftoffStateCacheEntry( struct drm_t *drm, con
 		uint64_t crtcW = srcWidth / frameInfo->layers[ i ].scale.x;
 		uint64_t crtcH = srcHeight / frameInfo->layers[ i ].scale.y;
 
-		if (g_bRotated)
+		if (g_bRotated && g_uOutputRotation == 0)
 		{
 			int64_t imageH = frameInfo->layers[ i ].tex->contentHeight() / frameInfo->layers[ i ].scale.y;
 
@@ -2668,7 +2674,7 @@ drm_prepare_liftoff( struct drm_t *drm, const struct FrameInfo_t *frameInfo, boo
 			liftoff_layer_set_property( drm->lo_layers[ i ], "SRC_H", entry.layerState[i].srcH );
 
 			uint64_t ulOrientation = DRM_MODE_ROTATE_0;
-			switch ( drm->pConnector->GetCurrentOrientation() )
+			switch ( g_uOutputRotation != 0 ? GAMESCOPE_PANEL_ORIENTATION_0 : drm->pConnector->GetCurrentOrientation() )
 			{
 			default:
 			case GAMESCOPE_PANEL_ORIENTATION_0:
@@ -3329,6 +3335,29 @@ static void drm_unset_mode( struct drm_t *drm )
 	g_nDynamicRefreshHz = 0;
 
 	g_bRotated = false;
+	g_uOutputRotation = 0;
+}
+
+// Bitmask of DRM_MODE_ROTATE_* the plane can do at scanout (just ROTATE_0 if it can't rotate).
+static uint64_t drm_plane_supported_rotations( struct drm_t *drm, gamescope::CDRMPlane *pPlane )
+{
+	if ( !pPlane->GetProperties().rotation )
+		return DRM_MODE_ROTATE_0;
+
+	drmModePropertyRes *pProp = drmModeGetProperty( drm->fd, pPlane->GetProperties().rotation->GetPropertyId() );
+	if ( !pProp )
+		return DRM_MODE_ROTATE_0;
+	defer( drmModeFreeProperty( pProp ) );
+
+	if ( !( pProp->flags & DRM_MODE_PROP_BITMASK ) )
+		return DRM_MODE_ROTATE_0;
+
+	uint64_t ulSupported = 0;
+	for ( int i = 0; i < pProp->count_enums; i++ )
+		if ( pProp->enums[i].value < 64 )
+			ulSupported |= 1ull << pProp->enums[i].value;
+
+	return ulSupported;
 }
 
 bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
@@ -3346,21 +3375,47 @@ bool drm_set_mode( struct drm_t *drm, const drmModeModeInfo *mode )
 
 	update_drm_effective_orientations(drm, mode);
 
+	// 90/270 transpose the output (g_bRotated); 180 flips in place.
+	uint32_t uStep = 0;
+	uint64_t ulNeeded = 0;
 	switch ( drm->pConnector->GetCurrentOrientation() )
 	{
 	default:
 	case GAMESCOPE_PANEL_ORIENTATION_0:
-	case GAMESCOPE_PANEL_ORIENTATION_180:
 		g_bRotated = false;
 		g_nOutputWidth = mode->hdisplay;
 		g_nOutputHeight = mode->vdisplay;
 		break;
+	case GAMESCOPE_PANEL_ORIENTATION_180:
+		g_bRotated = false;
+		g_nOutputWidth = mode->hdisplay;
+		g_nOutputHeight = mode->vdisplay;
+		uStep = 2u;
+		ulNeeded = DRM_MODE_ROTATE_180;
+		break;
 	case GAMESCOPE_PANEL_ORIENTATION_90:
+		g_bRotated = true;
+		g_nOutputWidth = mode->vdisplay;
+		g_nOutputHeight = mode->hdisplay;
+		uStep = 1u;
+		ulNeeded = DRM_MODE_ROTATE_90;
+		break;
 	case GAMESCOPE_PANEL_ORIENTATION_270:
 		g_bRotated = true;
 		g_nOutputWidth = mode->vdisplay;
 		g_nOutputHeight = mode->hdisplay;
+		uStep = 3u;
+		ulNeeded = DRM_MODE_ROTATE_270;
 		break;
+	}
+
+	// Rotate in the compositor when the scanout plane can't do the panel's orientation.
+	g_uOutputRotation = 0;
+	if ( uStep )
+	{
+		const bool bScanoutCanRotate = drm->pPrimaryPlane && ( drm_plane_supported_rotations( drm, drm->pPrimaryPlane ) & ulNeeded );
+		if ( g_bForceCompositionRotation || !bScanoutCanRotate )
+			g_uOutputRotation = uStep;
 	}
 
 	return true;
@@ -3599,7 +3654,7 @@ namespace gamescope
 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
 			bNeedsFullComposite |= pFrameInfo->blurLayer0;
 			bNeedsFullComposite |= bNeedsCompositeFromFilter;
-			bNeedsFullComposite |= !k_bUseCursorPlane && bDrewCursor;
+			bNeedsFullComposite |= !cv_drm_cursor_plane && bDrewCursor;
 			bNeedsFullComposite |= g_bColorSliderInUse;
 			bNeedsFullComposite |= pFrameInfo->bFadingOut;
 			bNeedsFullComposite |= !g_reshade_effect.empty();
@@ -3617,6 +3672,7 @@ namespace gamescope
 			}
 
 			bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
+			bNeedsFullComposite |= g_uOutputRotation != 0; // can't rotate planes at scanout
 
 			bool bDoComposite = true;
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
@@ -3980,7 +4036,7 @@ namespace gamescope
 
 		virtual glm::uvec2 CursorSurfaceSize( glm::uvec2 uvecSize ) const override
 		{
-			if ( !k_bUseCursorPlane )
+			if ( !cv_drm_cursor_plane )
 				return uvecSize;
 
 			return glm::uvec2{ g_DRM.cursor_width, g_DRM.cursor_height };

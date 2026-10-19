@@ -913,6 +913,7 @@ global_focus_t *GetCurrentMouseFocus()
 
 uint32_t		currentOutputWidth, currentOutputHeight;
 int 			currentOutputRefresh;
+uint32_t		currentOutputRotation = 0;
 bool			currentHDROutput = false;
 bool			currentHDRForce = false;
 
@@ -2443,7 +2444,7 @@ static void paint_pipewire()
 	}
 
 	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
-		? vulkan_acquire_capture_texture( uWidth, uHeight, false, DRM_FORMAT_XRGB2101010 )
+		? vulkan_acquire_capture_texture( uWidth, uHeight, false, vulkan_get_rgb10_capture_format() )
 		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
 
 	gamescope::Rc<CVulkanTexture> pYUVTexture = s_pPipewireBuffer->texture->isYcbcr() ? s_pPipewireBuffer->texture : nullptr;
@@ -2969,7 +2970,7 @@ paint_all( global_focus_t *pFocus, bool async )
 		uint32_t drmCaptureFormat = DRM_FORMAT_INVALID;
 
 		if ( path.extension() == ".avif" )
-			drmCaptureFormat = DRM_FORMAT_XRGB2101010;
+			drmCaptureFormat = vulkan_get_rgb10_capture_format();
 		else if ( path.extension() == ".png" )
 			drmCaptureFormat = DRM_FORMAT_XRGB8888;
 		else if ( path.extension() == ".bin" && path.stem().extension() == ".nv12" )
@@ -2989,6 +2990,15 @@ paint_all( global_focus_t *pFocus, bool async )
 		gamescope::Rc<CVulkanTexture> pScreenshotTexture;
 		if ( drmCaptureFormat != DRM_FORMAT_INVALID )
 			pScreenshotTexture = vulkan_acquire_screenshot_texture( uScreenshotWidth, uScreenshotHeight, false, drmCaptureFormat );
+
+		// Logical-sized scratch keeps NV12 captures unrotated and off the live output image.
+		gamescope::Rc<CVulkanTexture> pRGBTexture;
+		if ( pScreenshotTexture && drmCaptureFormat == DRM_FORMAT_NV12 )
+		{
+			pRGBTexture = vulkan_acquire_capture_texture( g_nOutputWidth, g_nOutputHeight, false, vulkan_get_rgb10_capture_format() );
+			if ( !pRGBTexture )
+				pScreenshotTexture = nullptr;
+		}
 
 		if ( pScreenshotTexture )
 		{
@@ -3050,7 +3060,7 @@ paint_all( global_focus_t *pFocus, bool async )
 
 			std::optional<uint64_t> oScreenshotSeq;
 			if ( drmCaptureFormat == DRM_FORMAT_NV12 )
-				oScreenshotSeq = vulkan_composite( &frameInfo, pScreenshotTexture, false, nullptr );
+				oScreenshotSeq = vulkan_composite( &frameInfo, pScreenshotTexture, false, pRGBTexture );
 			else if ( oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_FULL_COMPOSITION ||
 					  oScreenshotInfo->eScreenshotType == GAMESCOPE_CONTROL_SCREENSHOT_TYPE_SCREEN_BUFFER )
 				oScreenshotSeq = vulkan_composite( &frameInfo, nullptr, false, pScreenshotTexture );
@@ -3135,11 +3145,16 @@ paint_all( global_focus_t *pFocus, bool async )
 
 				bool bScreenshotSuccess = false;
 
-				if ( pScreenshotTexture->format() == VK_FORMAT_A2R10G10B10_UNORM_PACK32 )
+				if ( pScreenshotTexture->format() == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ||
+				     pScreenshotTexture->format() == VK_FORMAT_A2B10G10R10_UNORM_PACK32 )
 				{
 					// Make our own copy of the image to remove the alpha channel.
 					constexpr uint32_t kCompCnt = 3;
 					auto imageData = std::vector<uint16_t>( width * height * kCompCnt );
+
+					// R sits at bits 20-29 for XRGB, 0-9 for XBGR. B mirrors it.
+					const uint32_t uRedShift = pScreenshotTexture->format() == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? 20 : 0;
+					const uint32_t uBlueShift = 20 - uRedShift;
 
 					for (uint32_t y = 0; y < height; y++)
 					{
@@ -3148,9 +3163,9 @@ paint_all( global_focus_t *pFocus, bool async )
 							uint32_t *pInPixel = (uint32_t *)&mappedData[(y * pScreenshotTexture->rowPitch()) + x * (32 / 8)];
 							uint32_t uInPixel = *pInPixel;
 
-							imageData[y * width * kCompCnt + x * kCompCnt + 0] = (uInPixel & (0b1111111111 << 20)) >> 20;
-							imageData[y * width * kCompCnt + x * kCompCnt + 1] = (uInPixel & (0b1111111111 << 10)) >> 10;
-							imageData[y * width * kCompCnt + x * kCompCnt + 2] = (uInPixel & (0b1111111111 << 0))  >> 0;
+							imageData[y * width * kCompCnt + x * kCompCnt + 0] = (uInPixel >> uRedShift)  & 0b1111111111;
+							imageData[y * width * kCompCnt + x * kCompCnt + 1] = (uInPixel >> 10) & 0b1111111111;
+							imageData[y * width * kCompCnt + x * kCompCnt + 2] = (uInPixel >> uBlueShift) & 0b1111111111;
 						}
 					}
 
@@ -4385,7 +4400,8 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 	{
 		if (w->isOverlay)
 		{
-			if (w->GetGeometry().nWidth > 1200 && w->opacity >= maxOpacity)
+			// The interactive overlay (Steam/QAM) spans the full root window width or asks for input.
+			if ((w->GetGeometry().nWidth >= ctx->root_width || w->inputFocusMode) && w->opacity >= maxOpacity)
 			{
 				ctx->focus.overlayWindow = w;
 				maxOpacity = w->opacity;
@@ -4623,6 +4639,20 @@ void xwayland_ctx_t::DetermineAndApplyFocus( const std::vector< steamcompmgr_win
 		XMoveWindow(ctx->dpy, ctx->focus.focusWindow->xwayland().id, rect.nX + 1, rect.nY + 1);
 		XMoveWindow(ctx->dpy, ctx->focus.focusWindow->xwayland().id, rect.nX, rect.nY);
 		ctx->focus.focusWindow->nudged = true;
+	}
+
+	// X confines the pointer to the screen, so a screen-sized focus window only
+	// sees all of it at the origin. Place it there once, a client that moves it
+	// afterwards keeps its position. Oversized windows stay put, clients centre
+	// those to keep the middle reachable.
+	const Rect rect = w->GetGeometry();
+
+	if ( !w->placed && rect.nWidth == ctx->root_width && rect.nHeight == ctx->root_height )
+	{
+		if ( rect.nX != 0 || rect.nY != 0 )
+			XMoveWindow(ctx->dpy, w->xwayland().id, 0, 0);
+
+		w->placed = true;
 	}
 
 	if ( win_has_game_id( w ) )
@@ -5856,6 +5886,7 @@ add_win(xwayland_ctx_t *ctx, Window id, Window prev, unsigned long sequence)
 	new_win->requestedWidth = 0;
 	new_win->requestedHeight = 0;
 	new_win->nudged = false;
+	new_win->placed = false;
 	new_win->ignoreOverrideRedirect = false;
 
 	wlserver_x11_surface_info_init( &new_win->xwayland().surface, ctx->xwayland_server, id );
@@ -5920,6 +5951,10 @@ configure_win(xwayland_ctx_t *ctx, XConfigureEvent *ce)
 			ctx->root_height = ce->height;
 			MakeFocusDirty();
 
+			// Screen-sized is relative to the screen, re-arm every placement.
+			for ( steamcompmgr_win_t *pWindow = ctx->list; pWindow; pWindow = pWindow->xwayland().next )
+				pWindow->placed = false;
+
 			gamescope_xwayland_server_t *root_server = wlserver_get_xwayland_server(0);
 			xwayland_ctx_t *root_ctx = root_server->ctx.get();
 			XDeleteProperty( root_ctx->dpy, root_ctx->root, root_ctx->atoms.gamescopeXWaylandModeControl );
@@ -5927,6 +5962,11 @@ configure_win(xwayland_ctx_t *ctx, XConfigureEvent *ce)
 		}
 		return;
 	}
+
+	// Resizing re-arms the placement. Moving does not, so we never fight a
+	// client that drags its window off.
+	if ( ce->width != w->xwayland().a.width || ce->height != w->xwayland().a.height )
+		w->placed = false;
 
 	w->xwayland().a.x = ce->x;
 	w->xwayland().a.y = ce->y;
@@ -6599,7 +6639,7 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 			{
 				if (w->isOverlay)
 				{
-					if (w->GetGeometry().nWidth > 1200 && w->opacity >= maxOpacity)
+					if ((w->GetGeometry().nWidth >= ctx->root_width || w->inputFocusMode) && w->opacity >= maxOpacity)
 					{
 						ctx->focus.overlayWindow = w;
 						maxOpacity = w->opacity;
@@ -8844,8 +8884,10 @@ void steamcompmgr_check_xdg(bool vblank, uint64_t vblank_idx)
 			if (pFocus->fadeWindow && pFocus->fadeWindow->type == steamcompmgr_win_type_t::XDG)
 				pFocus->fadeWindow = nullptr;
 
+			if (pFocus->keyboardFocusWindow && pFocus->keyboardFocusWindow->type == steamcompmgr_win_type_t::XDG)
+				pFocus->keyboardFocusWindow = nullptr;
+			}
 			clear_pip_refs_matching( pFocus, []( steamcompmgr_win_t *w ) { return w->type == steamcompmgr_win_type_t::XDG; } );
-		}
 		g_steamcompmgr_xdg_wins = wlserver_get_xdg_shell_windows();
 		MakeFocusDirty();
 	}
@@ -8916,48 +8958,13 @@ static gamescope::ConVar<std::string> cv_mouse_relative_filter_appids( "mouse_re
 
 void LaunchNestedChildren( char **ppPrimaryChildArgv )
 {
-	std::string sNewPreload;
-	{
-		const char *pszCurrentPreload = getenv( "LD_PRELOAD" );
-		if ( pszCurrentPreload && *pszCurrentPreload )
-		{
-			// Remove gameoverlayrenderer.so from the child if Gamescope
-			// is running with a window + Vulkan swapchain (eg. SDL2 backend)
-			if ( GetBackend()->UsesVulkanSwapchain() )
-			{
-				std::vector<std::string_view> svLibraries = gamescope::Split( pszCurrentPreload, " :" );
-				std::erase_if( svLibraries, []( std::string_view svPreload )
-				{
-					return svPreload.find( "gameoverlayrenderer.so" ) != std::string_view::npos;
-				});
-
-				bool bFirst = true;
-				for ( std::string_view svLibrary : svLibraries )
-				{
-					if ( !bFirst )
-					{
-						sNewPreload.append( ":" );
-					}
-					bFirst = false;
-					sNewPreload.append( svLibrary );
-				}
-			}
-			else
-			{
-				sNewPreload = pszCurrentPreload;
-			}
-		}
-	}
-
 	// We could just run this inside the child process,
 	// but we might as well just run it here at this point.
-	// and affect all future child processes, without needing
-	// a pre-amble inside of them.
+	// and affect all future child processes.
 	{
-		if ( !sNewPreload.empty() )
-			setenv( "LD_PRELOAD", sNewPreload.c_str(), 1 );
-		else
-			unsetenv( "LD_PRELOAD" );
+		// We draw the overlay ourselves when we present with a swapchain, otherwise the game does.
+		if ( !gamescope::Process::RestoreSteamOverlayPreload() && GetBackend()->UsesVulkanSwapchain() )
+			gamescope::Process::RemoveSteamOverlayFromPreload();
 
 		unsetenv( "ENABLE_VKBASALT" );
 		// Enable Gamescope WSI by default for nested.
@@ -8995,7 +9002,8 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
 	if ( g_bLaunchMangoapp )
 	{
 		char *ppMangoappArgv[] = { (char *)"mangoapp", NULL };
-		gamescope::Process::SpawnProcessInWatchdog( ppMangoappArgv, true );
+		// The Steam overlay would latch onto mangoapp's own swapchain as if it were the game.
+		gamescope::Process::SpawnProcessInWatchdog( ppMangoappArgv, true, gamescope::Process::RemoveSteamOverlayFromPreload );
 	}
 
 	if ( !g_sPipCommand.empty() )
@@ -9420,6 +9428,7 @@ steamcompmgr_main(int argc, char **argv)
 		if ( currentOutputWidth != g_nOutputWidth ||
 			 currentOutputHeight != g_nOutputHeight ||
 			 currentOutputRefresh != g_nOutputRefresh ||
+			 currentOutputRotation != g_uOutputRotation ||
 			 currentHDROutput != g_bOutputHDREnabled ||
 			 currentHDRForce != g_bForceHDRSupportDebug )
 		{
@@ -9470,6 +9479,7 @@ steamcompmgr_main(int argc, char **argv)
 			currentOutputWidth = g_nOutputWidth;
 			currentOutputHeight = g_nOutputHeight;
 			currentOutputRefresh = g_nOutputRefresh;
+			currentOutputRotation = g_uOutputRotation;
 			currentHDROutput = g_bOutputHDREnabled;
 			currentHDRForce = g_bForceHDRSupportDebug;
 
