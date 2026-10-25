@@ -19,3 +19,6 @@
 [submodule "thirdparty/SPIRV-Headers"]
 	path = thirdparty/SPIRV-Headers
 	url = https://github.com/KhronosGroup/SPIRV-Headers/
+[submodule "site/themes/lambda"]
+	path = site/themes/lambda
+	url = https://github.com/koenemans/lambda.git
